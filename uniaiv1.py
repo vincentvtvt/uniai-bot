@@ -237,7 +237,6 @@ def webhook():
     # 2) FAQ lookup
     faq_ans = search_faq(config['faq_list'], msg)
     if faq_ans:
-        # Translate if needed
         send_whatsapp(config, phone, text=faq_ans)
         append_history(cust_rec, 'bot', faq_ans)
         return jsonify({'status':'ok'}),200
