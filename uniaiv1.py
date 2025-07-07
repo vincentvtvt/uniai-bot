@@ -41,27 +41,38 @@ TABLES = {
 def detect_language(text):
     return 'zh' if re.search(r'[一-鿿]', text) else 'en'
 
-# Fetch WhatsApp configuration from Airtable
+# Fetch WhatsApp configuration from Airtable by service number
 
-def fetch_whatsapp_config(wa_id):
-    params = {"filterByFormula": f"WhatsAppNumber='{wa_id}'"}
-    resp = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}", headers=HEADERS, params=params)
+def fetch_config_by_service(service_number):
+    formula = f"ServiceNumber='{service_number}'"
+    resp = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}", headers=HEADERS, params={"filterByFormula": formula})
     resp.raise_for_status()
-    records = resp.json().get("records", [])
-    if not records:
-        raise ValueError(f"No config found for WA ID: {wa_id}")
-    return records[0]["fields"]
+    recs = resp.json().get("records", [])
+    if not recs:
+        raise ValueError(f"No config found for service number: {service_number}")
+    return recs[0]["fields"]
 
-# Lookup predefined reply templates
+# Original fetch by customer (fallback)
+
+def fetch_config_by_customer(customer_number):
+    formula = f"WhatsAppNumber='{customer_number}'"
+    resp = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}", headers=HEADERS, params={"filterByFormula": formula})
+    resp.raise_for_status()
+    recs = resp.json().get("records", [])
+    if not recs:
+        raise ValueError(f"No config found for customer number: {customer_number}")
+    return recs[0]["fields"]
+
+# Lookup reply templates
 
 def find_template(business_id, wa_cfg_id, msg, lang):
     formula = f"AND(Business='{business_id}', WhatsAppConfig='{wa_cfg_id}', Language='{lang}')"
     resp = requests.get(f"{AIRTABLE_URL}/{TABLES['template']}", headers=HEADERS, params={"filterByFormula": formula})
     resp.raise_for_status()
     for rec in resp.json().get("records", []):
-        fields = rec["fields"]
-        if fields.get("Step", "").lower() in msg.lower():
-            return fields
+        f = rec["fields"]
+        if f.get("Step", "").lower() in msg.lower():
+            return f
     return None
 
 # Lookup knowledge base entries
@@ -70,11 +81,11 @@ def find_knowledge(business_id, msg, role):
     resp = requests.get(f"{AIRTABLE_URL}/{TABLES['knowledge']}", headers=HEADERS, params={"filterByFormula": f"Business='{business_id}'"})
     resp.raise_for_status()
     for rec in resp.json().get("records", []):
-        fields = rec["fields"]
-        if fields.get("Title", "").lower() in msg.lower():
-            scripts = json.loads(fields.get("RoleScripts", "{}"))
-            script = scripts.get(role) or fields.get("DefaultScript")
-            attachments = fields.get("ImageURL") or []
+        f = rec["fields"]
+        if f.get("Title", "").lower() in msg.lower():
+            scripts = json.loads(f.get("RoleScripts", "{}"))
+            script = scripts.get(role) or f.get("DefaultScript")
+            attachments = f.get("ImageURL") or []
             image_url = attachments[0]["url"] if attachments else None
             return script, image_url
     return None, None
@@ -151,23 +162,26 @@ def webhook():
     payload = request.get_json(force=True)
     logging.info("Incoming payload: %s", json.dumps(payload))
 
-    # Wassenger v1
-    if payload.get("object") == "message" and payload.get("event") == "message:in:new":
-        data = payload.get("data", {})
-        # Ignore group messages
-        if data.get("meta", {}).get("isGroup"):
-            logging.info("Ignoring group message from group chat")
-            return jsonify({"status": "ignored_group"})
-        msg = data.get("body", "").strip()
-        wa_id = data.get("fromNumber", "").strip()
-    # Wassenger v2
-    elif "body" in payload and "fromNumber" in payload: "body" in payload and "fromNumber" in payload:
-        msg = payload.get("body", "").strip()
-        wa_id = payload.get("fromNumber", "").strip()
-    else:
-        return jsonify({"status": "ignored"})
+    # Extract both customer and service numbers
+    data = payload.get("data", {}) if "data" in payload else payload
+    customer_number = data.get("fromNumber", "").strip()
+    service_number = data.get("toNumber", "").strip()
 
-    cfg = fetch_whatsapp_config(wa_id)
+    # Attempt config lookup by service number first
+    try:
+        cfg = fetch_config_by_service(service_number)
+    except ValueError:
+        # Fallback to customer number lookup
+        cfg = fetch_config_by_customer(customer_number)
+
+    # Ignore group messages
+    if data.get("meta", {}).get("isGroup"):
+        logging.info("Ignoring group message from group chat")
+        return jsonify({"status": "ignored_group"})
+
+    msg = data.get("body", "").strip()
+    wa = customer_number
+
     business = cfg.get("Business")
     role = cfg.get("Role")
     prompt = cfg.get("ClaudePrompt")
@@ -179,27 +193,28 @@ def webhook():
     tmpl = find_template(business, cfg.get("WhatsAppID"), msg, lang)
     if tmpl:
         if tmpl.get("ImageURL"):
-            send_image(wa_id, tmpl.get("ImageURL"), api_key)
-        send_whatsapp(wa_id, tmpl.get("TemplateBody"), api_key)
-        record_history(business, cfg.get("WhatsAppID"), wa_id, tmpl.get("Step", "step"), f"User:{msg}|Bot:{tmpl.get('TemplateBody')}")
+            send_image(wa, tmpl.get("ImageURL"), api_key)
+        send_whatsapp(wa, tmpl.get("TemplateBody"), api_key)
+        record_history(business, cfg.get("WhatsAppID"), wa, tmpl.get("Step", "step"), f"User:{msg}|Bot:{tmpl.get('TemplateBody')}")
         return jsonify({"status": "template_sent"})
 
     # 2) Knowledge
     script, img_url = find_knowledge(business, msg, role)
     if script:
         if img_url:
-            send_image(wa_id, img_url, api_key)
-        send_whatsapp(wa_id, script, api_key)
-        record_history(business, cfg.get("WhatsAppID"), wa_id, "knowledge", f"User:{msg}|Bot:{script}")
+            send_image(wa, img_url, api_key)
+        send_whatsapp(wa, script, api_key)
+        record_history(business, cfg.get("WhatsAppID"), wa, "knowledge", f"User:{msg}|Bot:{script}")
         return jsonify({"status": "knowledge_sent"})
 
     # 3) Fallback to Claude
     history_text = f"User: {msg}"
     reply = call_claude(msg, history_text, prompt, model)
-    send_whatsapp(wa_id, reply, api_key)
-    record_history(business, cfg.get("WhatsAppID"), wa_id, "fallback", f"User:{msg}|Bot:{reply}")
+    send_whatsapp(wa, reply, api_key)
+    record_history(business, cfg.get("WhatsAppID"), wa, "fallback", f"User:{msg}|Bot:{reply}")
     if any(keyword in reply.lower() for keyword in ("booking", "预约")):
-        record_sales(business, cfg.get("WhatsAppID"), wa_id, "Unknown", "TBD")
+        record_sales(business, cfg.get("WhatsAppID"), wa, "Unknown", "TBD")
+
     return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
