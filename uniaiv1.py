@@ -23,7 +23,8 @@ if not CLAUDE_API_KEY:
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
-# Airtable endpoints\AIRTABLE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
+# Airtable endpoints
+AIRTABLE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 HEADERS = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
 
 TABLES = {
@@ -69,7 +70,6 @@ def find_knowledge(business_id, msg, role):
         if fields.get("Title", "").lower() in msg.lower():
             scripts = json.loads(fields.get("RoleScripts", "{}"))
             script = scripts.get(role) or fields.get("DefaultScript")
-            # image URL list in Airtable attachments
             attachments = fields.get("ImageURL") or []
             image_url = attachments[0]["url"] if attachments else None
             return script, image_url
@@ -120,6 +120,7 @@ def record_sales(business, wa_cfg_id, phone, name, service, status="Pending"):
 
 # === Webhook endpoint ===
 @app.route("/webhook", methods=["POST"])
+@app.route("/", methods=["POST"])
 def webhook():
     payload = request.get_json(force=True)
     logging.info("Wassenger webhook payload: %s", payload)
