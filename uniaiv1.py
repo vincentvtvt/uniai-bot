@@ -9,13 +9,21 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Make sure we have API keys from environment
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+
+if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
+    raise RuntimeError("Missing AIRTABLE_API_KEY or AIRTABLE_BASE_ID in environment")
+if not CLAUDE_API_KEY:
+    logging.warning("CLAUDE_API_KEY not set; fallback to template/knowledge only")
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
-# Airtable setup\AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
+# Airtable endpoints\AIRTABLE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 HEADERS = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
 
 TABLES = {
@@ -35,8 +43,10 @@ def fetch_whatsapp_config(wa_id):
     params = {"filterByFormula": f"WhatsAppNumber='{wa_id}'"}
     res = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}", headers=HEADERS, params=params)
     res.raise_for_status()
-    fields = res.json()["records"][0]["fields"]
-    return fields
+    records = res.json().get("records", [])
+    if not records:
+        raise ValueError(f"No WhatsAppConfig found for {wa_id}")
+    return records[0]["fields"]
 
 # === Template lookup ===
 def find_template(business_id, wa_cfg_id, msg, lang):
@@ -44,8 +54,9 @@ def find_template(business_id, wa_cfg_id, msg, lang):
     res = requests.get(f"{AIRTABLE_URL}/{TABLES['template']}", headers=HEADERS, params=params)
     res.raise_for_status()
     for rec in res.json().get("records", []):
-        if rec["fields"].get("Step", "").lower() in msg.lower():
-            return rec["fields"]
+        fields = rec["fields"]
+        if fields.get("Step", "").lower() in msg.lower():
+            return fields
     return None
 
 # === KnowledgeBase lookup ===
@@ -56,15 +67,20 @@ def find_knowledge(business_id, msg, role):
     for rec in res.json().get("records", []):
         fields = rec["fields"]
         if fields.get("Title", "").lower() in msg.lower():
-            script = json.loads(fields.get("RoleScripts", "{}")).get(role) or fields.get("DefaultScript")
-            image_url = fields.get("ImageURL", [{}])[0].get("url") if fields.get("ImageURL") else None
+            scripts = json.loads(fields.get("RoleScripts", "{}"))
+            script = scripts.get(role) or fields.get("DefaultScript")
+            # image URL list in Airtable attachments
+            attachments = fields.get("ImageURL") or []
+            image_url = attachments[0]["url"] if attachments else None
             return script, image_url
     return None, None
 
 # === Claude call ===
 def call_claude(user_msg, history, prompt, model):
+    if not CLAUDE_API_KEY:
+        raise RuntimeError("Cannot call Claude: CLAUDE_API_KEY not set")
     url = "https://api.anthropic.com/v1/chat/completions"
-    headers = {"x-api-key": os.getenv("CLAUDE_API_KEY"), "Content-Type": "application/json"}
+    headers = {"x-api-key": CLAUDE_API_KEY, "Content-Type": "application/json"}
     messages = [
         {"role": "system", "content": prompt.format(history=history, user_message=user_msg)},
         {"role": "user", "content": user_msg}
@@ -76,37 +92,18 @@ def call_claude(user_msg, history, prompt, model):
 
 # === Wassenger send functions ===
 def send_whatsapp(phone: str, text: str, api_key: str):
-    """
-    Send a plain-text WhatsApp message via Wassenger.
-    """
     url = "https://api.wassenger.com/v1/messages"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "phone": phone,
-        "message": text
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"phone": phone, "message": text}
     resp = requests.post(url, headers=headers, json=payload)
     resp.raise_for_status()
     return resp.json()
 
 
 def send_image(phone: str, image_url: str, api_key: str):
-    """
-    Send an image message via Wassenger by passing a URL.
-    """
     url = "https://api.wassenger.com/v1/messages"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "phone": phone,
-        "message": "",      # optional caption
-        "url": image_url     # Wassenger treats this as an image
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"phone": phone, "message": "", "url": image_url}
     resp = requests.post(url, headers=headers, json=payload)
     resp.raise_for_status()
     return resp.json()
@@ -127,35 +124,34 @@ def webhook():
     payload = request.get_json(force=True)
     logging.info("Wassenger webhook payload: %s", payload)
 
-    # Only handle inbound messages
     if payload.get("object") == "message" and payload.get("event") == "message:in:new":
         incoming = payload.get("data", {})
-        msg   = incoming.get("body", "").strip()
+        msg = incoming.get("body", "").strip()
         wa_id = incoming.get("fromNumber", "").strip()
     else:
         return jsonify({"status": "ignored"}), 200
 
-    # Fetch config from Airtable
-    wa_cfg      = fetch_whatsapp_config(wa_id)
-    business_id = wa_cfg["Business"]
-    role        = wa_cfg["Role"]
-    prompt      = wa_cfg["ClaudePrompt"]
-    model       = wa_cfg["ClaudeModel"]
-    api_key     = wa_cfg.get("WASSENGER_API_KEY")  # rename your Airtable field if needed
+    # Fetch config
+    wa_cfg = fetch_whatsapp_config(wa_id)
+    business_id = wa_cfg.get("Business")
+    role = wa_cfg.get("Role")
+    prompt = wa_cfg.get("ClaudePrompt")
+    model = wa_cfg.get("ClaudeModel")
+    api_key = wa_cfg.get("WASSENGER_API_KEY")
 
     lang = detect_language(msg)
 
-    # Step 1: Template
+    # 1) Template
     template = find_template(business_id, wa_cfg.get("WhatsAppID"), msg, lang)
     if template:
         if template.get("ImageURL"):
-            send_image(wa_id, template["ImageURL"], api_key)
-        send_whatsapp(wa_id, template["TemplateBody"], api_key)
+            send_image(wa_id, template.get("ImageURL"), api_key)
+        send_whatsapp(wa_id, template.get("TemplateBody"), api_key)
         record_history(business_id, wa_cfg.get("WhatsAppID"), wa_id, template.get("Step", "step"),
-                       f"Customer: {msg} | Bot: {template['TemplateBody']}")
+                       f"Customer: {msg} | Bot: {template.get('TemplateBody')}")
         return jsonify({"status": "template_sent"})
 
-    # Step 2: KnowledgeBase
+    # 2) Knowledge
     script, image_url = find_knowledge(business_id, msg, role)
     if script:
         if image_url:
@@ -164,13 +160,13 @@ def webhook():
         record_history(business_id, wa_cfg.get("WhatsAppID"), wa_id, "knowledge", f"Customer: {msg} | Bot: {script}")
         return jsonify({"status": "knowledge_sent"})
 
-    # Step 3: Fallback to Claude
+    # 3) Fallback
     history_text = f"Customer: {msg}"
     reply = call_claude(msg, history_text, prompt, model)
     send_whatsapp(wa_id, reply, api_key)
     record_history(business_id, wa_cfg.get("WhatsAppID"), wa_id, "fallback", f"Customer: {msg} | Bot: {reply}")
 
-    # Record booking sales if detected
+    # Record sales
     if any(k in reply.lower() for k in ("booking", "预约")):
         record_sales(business_id, wa_cfg.get("WhatsAppID"), wa_id, "Unknown", "TBD")
 
