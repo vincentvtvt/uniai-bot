@@ -110,8 +110,13 @@ def call_claude(user_msg, history, prompt, model):
     }
     resp = requests.post(
         'https://api.anthropic.com/v1/complete',
-        headers={'x-api-key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+        headers={
+            'x-api-key': CLAUDE_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'Content-Type': 'application/json'
+        },
         json=payload
+    )
     )
     resp.raise_for_status()
     return resp.json().get('completion', '').strip()
