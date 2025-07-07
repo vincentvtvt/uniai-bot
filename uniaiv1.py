@@ -99,7 +99,6 @@ def send_whatsapp(phone: str, text: str, api_key: str):
     resp.raise_for_status()
     return resp.json()
 
-
 def send_image(phone: str, image_url: str, api_key: str):
     url = "https://api.wassenger.com/v1/messages"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -113,7 +112,6 @@ def record_history(business, wa_cfg_id, phone, step, history):
     data = {"fields": {"Business": business, "WhatsAppConfig": wa_cfg_id, "PhoneNumber": phone, "CurrentStep": step, "History": history}}
     requests.post(f"{AIRTABLE_URL}/{TABLES['history']}", headers={**HEADERS, "Content-Type": "application/json"}, json=data)
 
-
 def record_sales(business, wa_cfg_id, phone, name, service, status="Pending"):
     data = {"fields": {"Business": business, "WhatsAppConfig": wa_cfg_id, "PhoneNumber": phone, "CustomerName": name, "ServiceBooked": service, "Status": status}}
     requests.post(f"{AIRTABLE_URL}/{TABLES['sales']}", headers={**HEADERS, "Content-Type": "application/json"}, json=data)
@@ -123,12 +121,17 @@ def record_sales(business, wa_cfg_id, phone, name, service, status="Pending"):
 @app.route("/", methods=["POST"])
 def webhook():
     payload = request.get_json(force=True)
-    logging.info("Wassenger webhook payload: %s", payload)
+    logging.info("Wassenger webhook payload: %s", json.dumps(payload))
 
+    # Wassenger v1
     if payload.get("object") == "message" and payload.get("event") == "message:in:new":
         incoming = payload.get("data", {})
         msg = incoming.get("body", "").strip()
         wa_id = incoming.get("fromNumber", "").strip()
+    # Wassenger v2 (direct message payload)
+    elif "body" in payload and "fromNumber" in payload:
+        msg = payload.get("body", "").strip()
+        wa_id = payload.get("fromNumber", "").strip()
     else:
         return jsonify({"status": "ignored"}), 200
 
