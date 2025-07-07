@@ -26,13 +26,6 @@ app = Flask(__name__)
 # Airtable setup
 AIRTABLE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 HEADERS = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-TABLES = {
-    "config": "WhatsAppConfig",
-    "template": "WhatsAppReplyTemplate",
-    "knowledge": "KnowledgeBase",
-    "history": "CustomerHistory",
-    "sales": "SalesData"
-}
 
 # Utilities
 
@@ -163,6 +156,7 @@ def webhook():
     role = cfg.get("Role")
     pr = cfg.get("ClaudePrompt")
     mdl = cfg.get("ClaudeModel")
+    # Retrieve your Wassenger API key from Airtable (column: WASSENGER_API_KEY)
     key = cfg.get("WASSENGER_API_KEY")
     lang = detect_language(msg)
 
@@ -190,4 +184,8 @@ def webhook():
     send_whatsapp(wa, resp, key)
     record_history(bid, cfg.get("WhatsAppID"), wa, "fallback", f"User:{msg}|Bot:{resp}")
     if any(x in resp.lower() for x in ("booking","预约")):
-                record_sales(bid, cfg.get("WhatsAppID"), wa, "Unknown", "TBD")
+        record_sales(bid, cfg.get("WhatsAppID"), wa, "Unknown", "TBD")
+    return jsonify({"status": "ok"}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
