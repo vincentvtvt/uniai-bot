@@ -154,10 +154,14 @@ def webhook():
     # Wassenger v1
     if payload.get("object") == "message" and payload.get("event") == "message:in:new":
         data = payload.get("data", {})
+        # Ignore group messages
+        if data.get("meta", {}).get("isGroup"):
+            logging.info("Ignoring group message from group chat")
+            return jsonify({"status": "ignored_group"})
         msg = data.get("body", "").strip()
         wa_id = data.get("fromNumber", "").strip()
     # Wassenger v2
-    elif "body" in payload and "fromNumber" in payload:
+    elif "body" in payload and "fromNumber" in payload: "body" in payload and "fromNumber" in payload:
         msg = payload.get("body", "").strip()
         wa_id = payload.get("fromNumber", "").strip()
     else:
