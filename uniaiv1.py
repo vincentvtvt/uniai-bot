@@ -164,8 +164,8 @@ def webhook():
 
     # Extract both customer and service numbers
     data = payload.get("data", {}) if "data" in payload else payload
-    customer_number = data.get("fromNumber", "").strip()
-    service_number = data.get("toNumber", "").strip()
+    customer_number = data.get("fromNumber", "").strip().lstrip('+')  # normalize to digits only
+    service_number = data.get("toNumber", "").strip().lstrip('+')  # normalize to digits only (remove leading '+')
 
     # Attempt config lookup by service number first
     try:
