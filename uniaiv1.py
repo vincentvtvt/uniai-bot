@@ -94,31 +94,29 @@ def find_knowledge(business_id, msg, role):
 
 # Call Claude fallback with classic Anthropic API
 def call_claude(user_msg, history, prompt, model):
-    if not CLAUDE_API_KEY:
-        raise RuntimeError('CLAUDE_API_KEY not configured')
-    system_prompt    = prompt.format(history=history, user_message=user_msg)
-    human_prompt     = f"Human: {user_msg}"
-    assistant_prompt = "Assistant:"
-    full_prompt      = f"""{system_prompt}
-{human_prompt}
-{assistant_prompt}"""
-    payload = {
-        'model': model,
-        'prompt': full_prompt,
-        'max_tokens_to_sample': 512,
-        'temperature': 0.7
+    """
+    Send a chat‐style request to Anthropic’s v1/messages endpoint.
+    """
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": os.getenv("CLAUDE_API_KEY"),
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
     }
-    resp = requests.post(
-        'https://api.anthropic.com/v1/complete',
-        headers={
-            'x-api-key': CLAUDE_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'Content-Type': 'application/json'
-        },
-        json=payload
-    )
+    payload = {
+        "model": model,            # e.g. "claude-opus-4-20250514"
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "system",  "content": prompt.format(history=history, user_message=user_msg)},
+            {"role": "user",    "content": user_msg}
+        ]
+    }
+    resp = requests.post(url, headers=headers, json=payload)
     resp.raise_for_status()
-    return resp.json().get('completion', '').strip()
+    # extract the assistant’s reply
+    return resp.json()["choices"][0]["message"]["content"].strip()
+}
+
 
 # Send messages
 def send_whatsapp(phone, text, api_key):
