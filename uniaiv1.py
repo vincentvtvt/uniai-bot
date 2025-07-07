@@ -119,24 +119,34 @@ def find_knowledge(business_id, msg, role):
 
 # Call Claude for fallback replies
 def call_claude(user_msg, history, prompt, model):
+    """
+    Use Anthropic completion endpoint when chat/completions is unavailable.
+    """
     if not CLAUDE_API_KEY:
         raise RuntimeError('CLAUDE_API_KEY not configured')
+    # Build a combined prompt for the complete endpoint
+    full_prompt = (
+        prompt.format(history=history, user_message=user_msg)
+        + f"
+Human: {user_msg}
+Assistant:"
+    )
     payload = {
         'model': model,
-        'messages': [
-            {'role': 'system', 'content': prompt.format(history=history, user_message=user_msg)},
-            {'role': 'user', 'content': user_msg}
-        ],
+        'prompt': full_prompt,
         'max_tokens_to_sample': 512,
         'temperature': 0.7
     }
+    # Use the classic completion API
+    url = 'https://api.anthropic.com/v1/complete'
     resp = requests.post(
-        'https://api.anthropic.com/v1/chat/completions',
-        headers={'x-api-key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+        url,
+        headers={ 'x-api-key': CLAUDE_API_KEY, 'Content-Type': 'application/json' },
         json=payload
     )
     resp.raise_for_status()
-    return resp.json()['choices'][0]['message']['content'].strip()
+    # The key for completion endpoint is 'completion'
+    return resp.json().get('completion', '').strip()
 
 # Send text via Wassenger
 def send_whatsapp(phone, text, api_key):
