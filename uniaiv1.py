@@ -117,7 +117,6 @@ def call_claude(user_msg, history, prompt, model):
         },
         json=payload
     )
-    )
     resp.raise_for_status()
     return resp.json().get('completion', '').strip()
 
