@@ -125,8 +125,14 @@ def call_claude(user_msg, history, prompt, model):
     if not CLAUDE_API_KEY:
         raise RuntimeError('CLAUDE_API_KEY not configured')
     # Build a combined prompt for the complete endpoint
+        # Construct a single-line prompt
     full_prompt = (
         prompt.format(history=history, user_message=user_msg)
+        + "
+Human: " + user_msg
+        + "
+Assistant:"
+    )
         + f"
 Human: {user_msg}
 Assistant:"
