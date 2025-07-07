@@ -190,8 +190,4 @@ def webhook():
     send_whatsapp(wa, resp, key)
     record_history(bid, cfg.get("WhatsAppID"), wa, "fallback", f"User:{msg}|Bot:{resp}")
     if any(x in resp.lower() for x in ("booking","预约")):
-        record_sales(bid, cfg.get("WhatsAppID"), wa, "Unknown", "TBD")
-    return jsonify({"status": "ok"}), 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+                record_sales(bid, cfg.get("WhatsAppID"), wa, "Unknown", "TBD")
