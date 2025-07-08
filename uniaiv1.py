@@ -93,26 +93,22 @@ def find_template(biz: str, wa: str, msg: str) -> dict | None:
     return None
 
 def find_knowledge(biz: str, msg: str, role: str):
-    # Lookup KnowledgeBase by BusinessID, then match Title in msg
     formula = f"{{BusinessID}}='{biz}'"
     r = requests.get(f"{AIRTABLE_URL}/{TABLES['knowledge']}",
                      headers=AIRTABLE_HEADERS,
                      params={"filterByFormula": formula})
     r.raise_for_status()
     for rec in r.json().get("records", []):
-        f = rec["fields"]
-        title = f.get("Title", "")
+        flds = rec["fields"]
+        title = flds.get("Title", "")
         if title and title.lower() in msg.lower():
-            scripts = f.get("RoleScripts") or {}
-            script  = scripts.get(role) or f.get("DefaultScript")
-            img_url = None
-            if f.get("ImageURL"):
-                img_url = f["ImageURL"][0]["url"]
-            return script, img_url
+            scripts = flds.get("RoleScripts") or {}
+            script  = scripts.get(role) or flds.get("DefaultScript")
+            img     = (flds["ImageURL"][0]["url"] if flds.get("ImageURL") else None)
+            return script, img
     return None, None
 
 def call_claude(user_msg: str, history: str, prompt: str, model: str) -> str:
-    # Send to Anthropic's current chat API at /v1/messages
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key":         CLAUDE_API_KEY,
@@ -123,8 +119,8 @@ def call_claude(user_msg: str, history: str, prompt: str, model: str) -> str:
         "model":      model,
         "max_tokens": 1024,
         "messages": [
-            {"role": "system", "content": prompt.format(history=history, user_message=user_msg)},
-            {"role": "user",   "content": user_msg}
+            {"role":"system",  "content": prompt.format(history=history, user_message=user_msg)},
+            {"role":"user",    "content": user_msg}
         ]
     }
     r = requests.post(url, headers=headers, json=payload)
@@ -157,27 +153,27 @@ def send_image(phone: str, url: str, token: str):
 def record_history(biz: str, wa: str, phone: str, step: str, hist: str):
     requests.post(
         f"{AIRTABLE_URL}/{TABLES['history']}",
-        headers={**AIRTABLE_HEADERS, "Content-Type": "application/json"},
-        json={"fields": {
-            "BusinessID":     biz,
-            "WhatsAppConfig": wa,
-            "PhoneNumber":    phone,
-            "CurrentStep":    step,
-            "History":        hist
+        headers={**AIRTABLE_HEADERS, "Content-Type":"application/json"},
+        json={"fields":{
+            "BusinessID":      biz,
+            "WhatsAppConfig":  wa,
+            "PhoneNumber":     phone,
+            "CurrentStep":     step,
+            "History":         hist
         }}
     )
 
 def record_sales(biz: str, wa: str, phone: str, name: str, svc: str):
     requests.post(
         f"{AIRTABLE_URL}/{TABLES['sales']}",
-        headers={**AIRTABLE_HEADERS, "Content-Type": "application/json"},
-        json={"fields": {
-            "BusinessID":     biz,
-            "WhatsAppConfig": wa,
-            "PhoneNumber":    phone,
-            "CustomerName":   name,
-            "ServiceBooked":  svc,
-            "Status":         "Pending"
+        headers={**AIRTABLE_HEADERS, "Content-Type":"application/json"},
+        json={"fields":{
+            "BusinessID":      biz,
+            "WhatsAppConfig":  wa,
+            "PhoneNumber":     phone,
+            "CustomerName":    name,
+            "ServiceBooked":   svc,
+            "Status":          "Pending"
         }}
     )
 
@@ -185,7 +181,7 @@ def record_sales(biz: str, wa: str, phone: str, name: str, svc: str):
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET","POST"])
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if request.method == "GET":
@@ -196,6 +192,7 @@ def webhook():
 
     if payload.get("object") == "message" and payload.get("event") == "message:in:new":
         d = payload["data"]
+
         # ignore group messages
         if d.get("meta", {}).get("isGroup"):
             return jsonify(status="ignored_group"), 200
@@ -204,21 +201,20 @@ def webhook():
         svc_no_lookup = d["toNumber"].lstrip("+")
         cus_no_lookup = d["fromNumber"].lstrip("+")
         # For sending, keep E.164 with '+'
-        svc_no_raw = d["toNumber"]
-        cus_no_raw = d["fromNumber"]
-        msg = d["body"].strip()
+        cus_no_raw    = d["fromNumber"]
+        msg           = d["body"].strip()
 
-        # Step 1: fetch service config
+        # 1) Service config lookup
         scfg = fetch_service_config(svc_no_lookup)
         biz  = scfg["BusinessID"]
         wa   = scfg["WA_ID"]
         key  = scfg["WassengerApiKey"]
 
-        # Step 2: fetch business settings
+        # 2) Business settings lookup
         bcfg = fetch_business_settings(biz)
         lang = bcfg["DefaultLanguage"]
 
-        # Step 3: template lookup
+        # 3) Template lookup
         tpl = find_template(biz, wa, msg)
         if tpl:
             body = tpl.get("TemplateBody", "")
@@ -226,7 +222,7 @@ def webhook():
             record_history(biz, wa, cus_no_lookup, "template", f"C:{msg}|B:{body}")
             return jsonify(status="template_sent"), 200
 
-        # Step 4: knowledge base lookup
+        # 4) Knowledge lookup
         script, img = find_knowledge(biz, msg, scfg.get("Role", ""))
         if script:
             if img:
@@ -235,13 +231,13 @@ def webhook():
             record_history(biz, wa, cus_no_lookup, "knowledge", f"C:{msg}|B:{script}")
             return jsonify(status="knowledge_sent"), 200
 
-        # Step 5: fallback to Claude
+        # 5) Fallback to Claude
         history = f"Customer: {msg}"
-        reply  = call_claude(msg, history, bcfg["ClaudePrompt"], bcfg["ClaudeModel"])
+        reply   = call_claude(msg, history, bcfg["ClaudePrompt"], bcfg["ClaudeModel"])
         send_whatsapp(cus_no_raw, reply, key)
         record_history(biz, wa, cus_no_lookup, "fallback", f"C:{msg}|B:{reply}")
 
-        # optional: record sales if booking detected
+        # optional sales recording
         if "booking" in reply.lower() or "预约" in reply:
             record_sales(biz, wa, cus_no_lookup, "Unknown", "TBD")
 
