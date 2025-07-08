@@ -33,24 +33,30 @@ TABLES = {
 # ───── Flask app ─────
 app = Flask(__name__)
 
-@app.before_first_request
+# ───── Log routes & tools once on first request ─────
+startup_logged = False
+
+@app.before_request
 def log_routes_and_tools():
-    # 1) List all Flask routes
-    logger.debug("🚦 Flask routes:")
-    for rule in app.url_map.iter_rules():
-        methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
-        logger.debug(f"  • endpoint={rule.endpoint!r}, path={rule.rule}, methods=[{methods}]")
-    # 2) List all tool IDs
-    tools = [
-        "Default",
-        "InfoSearch",
-        "FormValidation",
-        "RerouteMobile",
-        "RerouteBiz",
-        "RerouteWinback",
-        "DropDropDrop"
-    ]
-    logger.debug("🧰 Available tools: %s", tools)
+    global startup_logged
+    if not startup_logged:
+        startup_logged = True
+        # 1) List all Flask routes
+        logger.debug("🚦 Flask routes:")
+        for rule in app.url_map.iter_rules():
+            methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
+            logger.debug(f"  • endpoint={rule.endpoint!r}, path={rule.rule}, methods=[{methods}]")
+        # 2) List all tool IDs
+        tools = [
+            "Default",
+            "InfoSearch",
+            "FormValidation",
+            "RerouteMobile",
+            "RerouteBiz",
+            "RerouteWinback",
+            "DropDropDrop"
+        ]
+        logger.debug("🧰 Available tools: %s", tools)
 
 # ───── Helper functions ─────
 def detect_language(text: str) -> str:
@@ -63,11 +69,7 @@ def call_claude(messages: list, model: str) -> dict:
         "anthropic-version": "2023-06-01",
         "Content-Type":      "application/json"
     }
-    payload = {
-        "model":      model,
-        "max_tokens": 1024,
-        "messages":   messages
-    }
+    payload = {"model": model, "max_tokens": 1024, "messages": messages}
     r = requests.post(url, headers=headers, json=payload)
     r.raise_for_status()
     return r.json()
@@ -166,11 +168,11 @@ def find_knowledge(biz: str, msg: str, role: str):
                      params={"filterByFormula": formula})
     r.raise_for_status()
     for rec in r.json().get("records", []):
-        f = rec["fields"]
-        if f.get("Title","").lower() in msg.lower():
-            scripts = f.get("RoleScripts") or {}
-            return scripts.get(role) or f.get("DefaultScript"), \
-                   (f["ImageURL"][0]["url"] if f.get("ImageURL") else None)
+        flds = rec["fields"]
+        if flds.get("Title","").lower() in msg.lower():
+            scripts = flds.get("RoleScripts") or {}
+            return scripts.get(role) or flds.get("DefaultScript"), \
+                   (flds["ImageURL"][0]["url"] if flds.get("ImageURL") else None)
     return None, None
 
 def validate_form(message: str) -> str:
@@ -246,26 +248,22 @@ def webhook():
         logger.debug("2) Numbers — lookup svc:%s cus:%s, raw cus:%s", svc_no_lookup, cus_no_lookup, cus_no_raw)
         logger.debug("   Message: %s", msg)
 
-        # fetch and log configs
         scfg = fetch_service_config(svc_no_lookup)
         bcfg = fetch_business_settings(scfg["BusinessID"])
         logger.debug("3) Service config: %s", scfg)
         logger.debug("4) Business settings: %s", bcfg)
 
-        # detect language
         lang = detect_language(msg)
         logger.debug("5) Detected language: %s", lang)
 
-        # select and log tool
         tool = select_tool(msg)
         logger.debug("6) Selected tool: %s", tool)
 
-        # branch on tool...
         if tool == "Default":
             tpl = find_template(scfg["BusinessID"], scfg["WA_ID"])
             logger.debug("7a) Template lookup: %s", tpl)
             if tpl:
-                body = tpl.get("TemplateBody","")
+                body = tpl.get("TemplateBody", "")
                 send_whatsapp(cus_no_raw, body, scfg["WassengerApiKey"])
                 record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "template", f"C:{msg}|B:{body}")
                 return jsonify(status="template_sent"), 200
@@ -302,17 +300,4 @@ def webhook():
             if img:
                 send_image(cus_no_raw, img, scfg["WassengerApiKey"])
             send_whatsapp(cus_no_raw, script or "Sorry, I couldn't find that info.", scfg["WassengerApiKey"])
-            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "infosearch", f"C:{msg}|B:{script}")
-            return jsonify(status="info_sent"), 200
-
-        elif tool == "FormValidation":
-            result = validate_form(msg)
-            logger.debug("9) FormValidation result: %s", result)
-            send_whatsapp(cus_no_raw, result, scfg["WassengerApiKey"])
-            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "form_validation", f"C:{msg}|B:{result}")
-            return jsonify(status="form_validated"), 200
-
-        elif tool == "RerouteMobile":
-            send_whatsapp(cus_no_raw, "I’ll connect you with our Mobile team.", scfg["WassengerApiKey"])
-            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "reroute_mobile", f"C:{msg}")
-            return
+            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "infos_]()_
