@@ -1,16 +1,25 @@
 import sys
 import types
 
-# ─── STUB OUT 'micropip' TO AVOID MODULE NOT FOUND ERRORS ─────────────────────────
-# Some dependencies may try to import 'micropip'. Provide a no-op stub.
+# ─── STUB MODULES TO AVOID MODULE NOT FOUND ERRORS ───────────────────────────────
+# Stub out 'micropip' if missing
 micropip_stub = types.ModuleType('micropip')
-# stub install() if called
 micropip_stub.install = lambda *args, **kwargs: None
 sys.modules['micropip'] = micropip_stub
 
+# Stub out 'airtable' if missing, with clear error on use
+try:
+    from airtable import Airtable
+except ModuleNotFoundError:
+    class Airtable:
+        def __init__(self, base_id, table_name, api_key):
+            raise RuntimeError(
+                "Missing required module 'airtable'.\n"
+                "Please install via: pip install airtable-python-wrapper"
+            )
+
 import os
 from flask import Flask, request, jsonify
-from airtable import Airtable
 import tools  # your module of tool functions
 from your_history_module import record_history, fetch_history
 
@@ -26,17 +35,13 @@ TABLE_TEMPLATES  = "WhatsAppReplyTemplate"
 TABLE_HISTORY    = "CustomerHistoryTable"
 TABLE_SALES      = "SalesData"
 
-# Initialize Airtable clients
-airtable_clients = {}
-for tbl in [TABLE_BUSINESS, TABLE_WA, TABLE_TOOLS, TABLE_TEMPLATES, TABLE_HISTORY, TABLE_SALES]:
-    airtable_clients[tbl] = Airtable(AIRTABLE_BASE_ID, tbl, AIRTABLE_PAT)
-
-business_at = airtable_clients[TABLE_BUSINESS]
-wa_at       = airtable_clients[TABLE_WA]
-tools_at    = airtable_clients[TABLE_TOOLS]
-template_at = airtable_clients[TABLE_TEMPLATES]
-history_at  = airtable_clients[TABLE_HISTORY]
-sales_at    = airtable_clients[TABLE_SALES]
+# Initialize Airtable clients (will raise at startup if Airtable lib missing)
+business_at = Airtable(AIRTABLE_BASE_ID, TABLE_BUSINESS, AIRTABLE_PAT)
+wa_at       = Airtable(AIRTABLE_BASE_ID, TABLE_WA, AIRTABLE_PAT)
+tools_at    = Airtable(AIRTABLE_BASE_ID, TABLE_TOOLS, AIRTABLE_PAT)
+template_at = Airtable(AIRTABLE_BASE_ID, TABLE_TEMPLATES, AIRTABLE_PAT)
+history_at  = Airtable(AIRTABLE_BASE_ID, TABLE_HISTORY, AIRTABLE_PAT)
+sales_at    = Airtable(AIRTABLE_BASE_ID, TABLE_SALES, AIRTABLE_PAT)
 
 # ─── LOAD CONFIG AND KB INTO MEMORY ─────────────────────────────────────────────
 # Business and WhatsApp configuration as dicts keyed by ID
@@ -69,8 +74,12 @@ def webhook():
     lang    = payload.get('Language', 'en')
 
     # 1) Lookup configs from Airtable
-    scfg = business_cfg.get(biz_id, {})
-    wcfg = wa_cfg.get(wa_id, {})
+    scfg = business_cfg.get(biz_id)
+    if scfg is None:
+        return jsonify(error=f"Unknown BusinessID: {biz_id}"), 400
+    wcfg = wa_cfg.get(wa_id)
+    if wcfg is None:
+        return jsonify(error=f"Unknown WA_ID: {wa_id}"), 400
 
     # 2) Fetch recent history for context
     recent_hist = fetch_history(history_at, biz_id, wa_id, phone)
@@ -80,20 +89,29 @@ def webhook():
     handler   = getattr(tools, tool_name, tools.DefaultTool)
 
     # 4) Execute the tool function
-    result = handler(
-        business_id = biz_id,
-        wa_id       = wa_id,
-        phone       = phone,
-        message     = msg,
-        api_key     = wcfg.get('WassengerApiKey'),
-        history     = recent_hist,
-        sales_data  = sales_data
-    )
+    try:
+        result = handler(
+            business_id = biz_id,
+            wa_id       = wa_id,
+            phone       = phone,
+            message     = msg,
+            api_key     = wcfg.get('WassengerApiKey'),
+            history     = recent_hist,
+            sales_data  = sales_data
+        )
+    except Exception as e:
+        # Log error and respond gracefully
+        record_history(biz_id, wa_id, phone, 'ErrorHandler', str(e))
+        return jsonify(error=str(e)), 500
 
     # 5) Format the response using templates if available
     if (cat, lang) in TEMPLATES:
         template = TEMPLATES[(cat, lang)]
-        response = template.format(**result)
+        try:
+            response = template.format(**result)
+        except Exception as e:
+            record_history(biz_id, wa_id, phone, 'TemplateError', str(e))
+            response = result.get('text', '')
     else:
         response = result.get('text', '')
 
@@ -115,10 +133,14 @@ def webhook():
 if __name__ == '__main__':
     import unittest
     
-    class TestMicropipStub(unittest.TestCase):
+    class TestStubs(unittest.TestCase):
         def test_micropip_importable(self):
             import micropip
             self.assertTrue(hasattr(micropip, 'install'))
+        def test_airtable_stub_message(self):
+            with self.assertRaises(RuntimeError) as ctx:
+                Airtable('base','table','key')
+            self.assertIn('pip install airtable-python-wrapper', str(ctx.exception))
 
     unittest.main()
 
