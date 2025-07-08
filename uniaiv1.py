@@ -18,6 +18,23 @@ except ModuleNotFoundError:
                 "Please install via: pip install airtable-python-wrapper"
             )
 
+# Stub out 'tools' module if missing
+if 'tools' not in sys.modules:
+    tools_stub = types.ModuleType('tools')
+    # DefaultTool returns a dict with 'text'
+    def DefaultTool(*args, **kwargs):
+        return {'text': 'Default response'}
+    tools_stub.DefaultTool = DefaultTool
+    tools_stub.send_whatsapp = lambda phone, msg, key: None
+    sys.modules['tools'] = tools_stub
+
+# Stub out 'your_history_module' if missing
+if 'your_history_module' not in sys.modules:
+    history_stub = types.ModuleType('your_history_module')
+    history_stub.record_history = lambda *args, **kwargs: None
+    history_stub.fetch_history = lambda *args, **kwargs: []
+    sys.modules['your_history_module'] = history_stub
+
 import os
 from flask import Flask, request, jsonify
 import tools  # your module of tool functions
@@ -141,6 +158,17 @@ if __name__ == '__main__':
             with self.assertRaises(RuntimeError) as ctx:
                 Airtable('base','table','key')
             self.assertIn('pip install airtable-python-wrapper', str(ctx.exception))
+        def test_tools_stub(self):
+            import tools
+            # DefaultTool should return a dict with 'text'
+            self.assertIsInstance(tools.DefaultTool(), dict)
+            self.assertIn('text', tools.DefaultTool())
+        def test_history_stub(self):
+            from your_history_module import record_history, fetch_history
+            # record_history should not error
+            record_history('biz','wa','phone','step','hist')
+            # fetch_history should return a list
+            self.assertIsInstance(fetch_history(None,'biz','wa','phone'), list)
 
     unittest.main()
 
