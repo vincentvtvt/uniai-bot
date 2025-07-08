@@ -31,26 +31,32 @@ def detect_language(text: str) -> str:
     return "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
 
 def fetch_service_config(svc_no: str) -> dict:
-    # Lookup row in WhatsappConfig by numeric WhatsappNumber
+    """
+    Lookup in WhatsappConfig where {WhatsappNumber} = svc_no (digits only),
+    unpack the linked BusinessID from the Business lookup column.
+    """
     formula = f"{{WhatsappNumber}}='{svc_no}'"
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    recs = r.json().get("records", [])
+    resp = requests.get(
+        f"{AIRTABLE_URL}/{TABLES['config']}",
+        headers=AIRTABLE_HEADERS,
+        params={"filterByFormula": formula}
+    )
+    resp.raise_for_status()
+    recs = resp.json().get("records", [])
     if not recs:
-        raise ValueError(f"No WhatsappConfig found for number {svc_no}")
-    f = recs[0]["fields"]
+        raise ValueError(f"No WhatsappConfig for number {svc_no}")
+    fields = recs[0]["fields"]
 
-    wa_id = f.get("WA_ID")
-    token = f.get("WASSENGER_API_KEY")
+    # Extract WA_ID and Wassenger API key
+    wa_id = fields.get("WA_ID")
+    token = fields.get("WASSENGER_API_KEY")
     if not (wa_id and token):
-        raise ValueError("Config row missing WA_ID or WASSENGER_API_KEY")
+        raise ValueError("Config record missing WA_ID or WASSENGER_API_KEY")
 
-    # Unpack the linked BusinessID (from Business)
-    biz_list = f.get("BusinessID (from Business)", [])
+    # **Correct** lookup column name:
+    biz_list = fields.get("BusinessID (from Business)", [])
     if not isinstance(biz_list, list) or not biz_list:
-        raise ValueError("Config row missing BusinessID lookup")
+        raise ValueError("Config record missing BusinessID (from Business) lookup")
     business_id = biz_list[0]
 
     return {
@@ -60,13 +66,17 @@ def fetch_service_config(svc_no: str) -> dict:
     }
 
 def fetch_business_settings(biz_id: str) -> dict:
-    # Lookup row in BusinessConfig by BusinessID
+    """
+    Lookup in BusinessConfig where {BusinessID} = biz_id.
+    """
     formula = f"{{BusinessID}}='{biz_id}'"
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['business']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    recs = r.json().get("records", [])
+    resp = requests.get(
+        f"{AIRTABLE_URL}/{TABLES['business']}",
+        headers=AIRTABLE_HEADERS,
+        params={"filterByFormula": formula}
+    )
+    resp.raise_for_status()
+    recs = resp.json().get("records", [])
     if not recs:
         raise ValueError(f"No BusinessConfig for ID {biz_id}")
     f = recs[0]["fields"]
@@ -77,34 +87,42 @@ def fetch_business_settings(biz_id: str) -> dict:
     }
 
 def find_template(biz: str, wa: str, msg: str) -> dict | None:
-    # Lookup row in WhatsAppReplyTemplate by BusinessID & WA_ID
+    """
+    Lookup in WhatsAppReplyTemplate where:
+      {BusinessID (from Business)} = biz
+      AND {WhatsAppConfig} = wa
+    """
     formula = (
         "AND("
           "{BusinessID (from Business)}='" + biz + "',"
           "{WhatsAppConfig}='"             + wa  + "'"
         ")"
     )
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['template']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    for rec in r.json().get("records", []):
+    resp = requests.get(
+        f"{AIRTABLE_URL}/{TABLES['template']}",
+        headers=AIRTABLE_HEADERS,
+        params={"filterByFormula": formula}
+    )
+    resp.raise_for_status()
+    for rec in resp.json().get("records", []):
         return rec["fields"]
     return None
 
 def find_knowledge(biz: str, msg: str, role: str):
     formula = f"{{BusinessID}}='{biz}'"
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['knowledge']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    for rec in r.json().get("records", []):
-        flds = rec["fields"]
-        title = flds.get("Title", "")
+    resp = requests.get(
+        f"{AIRTABLE_URL}/{TABLES['knowledge']}",
+        headers=AIRTABLE_HEADERS,
+        params={"filterByFormula": formula}
+    )
+    resp.raise_for_status()
+    for rec in resp.json().get("records", []):
+        f = rec["fields"]
+        title = f.get("Title","")
         if title and title.lower() in msg.lower():
-            scripts = flds.get("RoleScripts") or {}
-            script  = scripts.get(role) or flds.get("DefaultScript")
-            img     = (flds["ImageURL"][0]["url"] if flds.get("ImageURL") else None)
+            scripts = f.get("RoleScripts") or {}
+            script  = scripts.get(role) or f.get("DefaultScript")
+            img     = (f["ImageURL"][0]["url"] if f.get("ImageURL") else None)
             return script, img
     return None, None
 
@@ -119,8 +137,8 @@ def call_claude(user_msg: str, history: str, prompt: str, model: str) -> str:
         "model":      model,
         "max_tokens": 1024,
         "messages": [
-            {"role":"system",  "content": prompt.format(history=history, user_message=user_msg)},
-            {"role":"user",    "content": user_msg}
+            {"role":"system", "content": prompt.format(history=history, user_message=user_msg)},
+            {"role":"user",   "content": user_msg}
         ]
     }
     r = requests.post(url, headers=headers, json=payload)
@@ -128,7 +146,11 @@ def call_claude(user_msg: str, history: str, prompt: str, model: str) -> str:
     return r.json()["choices"][0]["message"]["content"].strip()
 
 def send_whatsapp(phone: str, text: str, token: str):
-    # Wassenger expects header "Token" and E.164 phone with leading '+'
+    """
+    Wassenger v1 expects:
+      - Header: Token: <your_token>
+      - JSON: { "phone": "+E164", "message": "..." }
+    """
     r = requests.post(
         "https://api.wassenger.com/v1/messages",
         headers={
@@ -197,24 +219,24 @@ def webhook():
         if d.get("meta", {}).get("isGroup"):
             return jsonify(status="ignored_group"), 200
 
-        # For lookup, strip '+'
+        # strip '+' for Airtable lookups
         svc_no_lookup = d["toNumber"].lstrip("+")
         cus_no_lookup = d["fromNumber"].lstrip("+")
-        # For sending, keep E.164 with '+'
+        # keep '+' for sending back
         cus_no_raw    = d["fromNumber"]
         msg           = d["body"].strip()
 
-        # 1) Service config lookup
+        # 1) fetch service config
         scfg = fetch_service_config(svc_no_lookup)
         biz  = scfg["BusinessID"]
         wa   = scfg["WA_ID"]
         key  = scfg["WassengerApiKey"]
 
-        # 2) Business settings lookup
+        # 2) fetch business settings
         bcfg = fetch_business_settings(biz)
         lang = bcfg["DefaultLanguage"]
 
-        # 3) Template lookup
+        # 3) template lookup
         tpl = find_template(biz, wa, msg)
         if tpl:
             body = tpl.get("TemplateBody", "")
@@ -222,8 +244,8 @@ def webhook():
             record_history(biz, wa, cus_no_lookup, "template", f"C:{msg}|B:{body}")
             return jsonify(status="template_sent"), 200
 
-        # 4) Knowledge lookup
-        script, img = find_knowledge(biz, msg, scfg.get("Role", ""))
+        # 4) knowledge lookup
+        script, img = find_knowledge(biz, msg, scfg.get("Role",""))
         if script:
             if img:
                 send_image(cus_no_raw, img, key)
@@ -231,7 +253,7 @@ def webhook():
             record_history(biz, wa, cus_no_lookup, "knowledge", f"C:{msg}|B:{script}")
             return jsonify(status="knowledge_sent"), 200
 
-        # 5) Fallback to Claude
+        # 5) fallback to Claude
         history = f"Customer: {msg}"
         reply   = call_claude(msg, history, bcfg["ClaudePrompt"], bcfg["ClaudeModel"])
         send_whatsapp(cus_no_raw, reply, key)
