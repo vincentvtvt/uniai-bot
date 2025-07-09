@@ -1,169 +1,303 @@
-import sys
-import types
-
-# ─── STUB MODULES TO AVOID MODULE NOT FOUND ERRORS ───────────────────────────────
-# Stub out 'micropip' if missing
-micropip_stub = types.ModuleType('micropip')
-micropip_stub.install = lambda *args, **kwargs: None
-sys.modules['micropip'] = micropip_stub
-
-# Stub out 'airtable' module if missing, providing a dummy client
-try:
-    from airtable import Airtable as RealAirtable
-    Airtable = RealAirtable
-except ModuleNotFoundError:
-    class Airtable:
-        """
-        Dummy Airtable client stub. All tables return empty list.
-        """
-        def __init__(self, base_id, table_name, api_key):
-            # no-op init
-            self.base_id = base_id
-            self.table_name = table_name
-            self.api_key = api_key
-        def get_all(self):
-            return []
-
-# Stub out 'tools' module if missing
-eventual_tools = sys.modules.get('tools')
-if eventual_tools is None:
-    tools = types.ModuleType('tools')
-    def DefaultTool(*args, **kwargs):
-        return {'text': 'Default response'}
-    def send_whatsapp(phone, msg, key):
-        # no-op send
-        pass
-    tools.DefaultTool = DefaultTool
-    tools.send_whatsapp = send_whatsapp
-    sys.modules['tools'] = tools
-else:
-    import tools
-
-# Stub out 'your_history_module' if missing
-if 'your_history_module' not in sys.modules:
-    history_stub = types.ModuleType('your_history_module')
-    history_stub.record_history = lambda *args, **kwargs: None
-    history_stub.fetch_history = lambda *args, **kwargs: []
-    sys.modules['your_history_module'] = history_stub
-
 import os
+import re
+import logging
+import requests
 from flask import Flask, request, jsonify
-import tools  # your module of tool functions
-from your_history_module import record_history, fetch_history
+from dotenv import load_dotenv
 
-# ─── AIRTABLE CONFIG ────────────────────────────────────────────────────────────
+# ───── Load & validate environment variables ─────
+load_dotenv()
 AIRTABLE_PAT     = os.getenv("AIRTABLE_PAT")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY")
 
-# Table names in your Airtable base
-TABLE_BUSINESS   = "BusinessConfig"
-TABLE_WA         = "WhatsappConfig"
-TABLE_TOOLS      = "KnowledgeBase"
-TABLE_TEMPLATES  = "WhatsAppReplyTemplate"
-TABLE_HISTORY    = "CustomerHistoryTable"
-TABLE_SALES      = "SalesData"
+if not (AIRTABLE_PAT and AIRTABLE_BASE_ID and CLAUDE_API_KEY):
+    raise RuntimeError("Please set AIRTABLE_PAT, AIRTABLE_BASE_ID, and CLAUDE_API_KEY in your .env")
 
-# Initialize Airtable clients (stubbed if library missing)
-business_at = Airtable(AIRTABLE_BASE_ID, TABLE_BUSINESS, AIRTABLE_PAT)
-wa_at       = Airtable(AIRTABLE_BASE_ID, TABLE_WA, AIRTABLE_PAT)
-tools_at    = Airtable(AIRTABLE_BASE_ID, TABLE_TOOLS, AIRTABLE_PAT)
-template_at = Airtable(AIRTABLE_BASE_ID, TABLE_TEMPLATES, AIRTABLE_PAT)
-history_at  = Airtable(AIRTABLE_BASE_ID, TABLE_HISTORY, AIRTABLE_PAT)
-sales_at    = Airtable(AIRTABLE_BASE_ID, TABLE_SALES, AIRTABLE_PAT)
+# ───── Configure logging ─────
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# ─── LOAD CONFIG AND KB INTO MEMORY ─────────────────────────────────────────────
-business_cfg = {rec['fields']['BusinessID']: rec['fields'] for rec in business_at.get_all()}
-wa_cfg       = {rec['fields']['WA_ID']:        rec['fields'] for rec in wa_at.get_all()}
-TOOL_MAP     = {rec['fields']['Category']: rec['fields']['ToolFunction'] for rec in tools_at.get_all()}
-TEMPLATES    = {(rec['fields']['Category'], rec['fields'].get('Language', 'en')): rec['fields']['Template'] 
-                for rec in template_at.get_all()}
-sales_data   = [rec['fields'] for rec in sales_at.get_all()]
+# ───── Airtable configuration ─────
+AIRTABLE_URL     = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
+AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_PAT}"}
+TABLES = {
+    "business": "BusinessConfig",
+    "config":   "WhatsappConfig",
+    "template": "WhatsAppReplyTemplate",
+    "knowledge":"KnowledgeBase",
+    "history":  "CustomerHistory",
+    "sales":    "SalesData",
+}
 
-# ─── FLASK SETUP ────────────────────────────────────────────────────────────────
+# ───── Flask app ─────
 app = Flask(__name__)
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    payload = request.get_json(force=True)
-    biz_id  = payload.get('BusinessID')
-    wa_id   = payload.get('WA_ID')
-    phone   = payload.get('customer_phone')
-    msg     = payload.get('message', '')
-    cat     = payload.get('Category', '')
-    lang    = payload.get('Language', 'en')
+# ───── Log routes & tools once on first request ─────
+startup_logged = False
 
-    # 1) Lookup configs from Airtable
-    scfg = business_cfg.get(biz_id, {})
-    wcfg = wa_cfg.get(wa_id, {})
+@app.before_request
+def log_routes_and_tools():
+    global startup_logged
+    if not startup_logged:
+        startup_logged = True
+        # 1) List all Flask routes
+        logger.debug("🚦 Flask routes:")
+        for rule in app.url_map.iter_rules():
+            methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
+            logger.debug(f"  • endpoint={rule.endpoint!r}, path={rule.rule}, methods=[{methods}]")
+        # 2) List all tool IDs
+        tools = [
+            "Default",
+            "InfoSearch",
+            "FormValidation",
+            "RerouteMobile",
+            "RerouteBiz",
+            "RerouteWinback",
+            "DropDropDrop"
+        ]
+        logger.debug("🧰 Available tools: %s", tools)
 
-    # 2) Fetch recent history for context
-    recent_hist = fetch_history(history_at, biz_id, wa_id, phone)
+# ───── Helper functions ─────
+def detect_language(text: str) -> str:
+    return "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
 
-    # 3) Determine the tool to dispatch via knowledge base
-    tool_name = TOOL_MAP.get(cat, 'DefaultTool')
-    handler   = getattr(tools, tool_name, tools.DefaultTool)
+def call_claude(messages: list, model: str) -> dict:
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key":         CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type":      "application/json"
+    }
+    payload = {"model": model, "max_tokens": 1024, "messages": messages}
+    r = requests.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    return r.json()
 
-    # 4) Execute the tool function
-    result = {}
+def select_tool(msg: str) -> str:
+    router_prompt = """You are a Sales Manager reviewing a WhatsApp conversation. 
+Decide exactly one of the following TOOLS for the SalesPerson to use next.
+Do NOT craft a reply to the customer—ONLY output the tool ID in JSON.
+TOOLS:
+Default         – Continue conversation normally.
+InfoSearch      – Search the company knowledge base.
+FormValidation  – Validate a filled submission form.
+RerouteMobile   – Customer only wants mobile/postpaid.
+RerouteBiz      – Customer wants business/corporate plan.
+RerouteWinback  – Customer is switching from another provider.
+DropDropDrop    – Stop all conversation per policy.
+SalesPersonKnowledge:
+- Has templates & basic Unifi Fibre info.
+- Does NOT know edge-case details.
+Customer said: "%s"
+Output:
+{"TOOLS":"<tool_id>"}
+""" % msg
+
+    resp = call_claude(
+        messages=[{"role": "system", "content": router_prompt}],
+        model="claude-opus-4-20250514"
+    )
+    text = resp["choices"][0]["message"]["content"].strip()
+    logger.debug("Router response: %s", text)
     try:
-        result = handler(
-            business_id=biz_id,
-            wa_id=wa_id,
-            phone=phone,
-            message=msg,
-            api_key=wcfg.get('WassengerApiKey'),
-            history=recent_hist,
-            sales_data=sales_data
-        ) or {}
-    except Exception as e:
-        record_history(biz_id, wa_id, phone, 'ErrorHandler', str(e))
-        return jsonify(error=str(e)), 500
+        return text.split('"')[1]
+    except:
+        logger.error("Failed to parse tool from router response")
+        return "Default"
 
-    # 5) Format the response using templates if available
-    if (cat, lang) in TEMPLATES:
-        try:
-            response = TEMPLATES[(cat, lang)].format(**result)
-        except Exception as e:
-            record_history(biz_id, wa_id, phone, 'TemplateError', str(e))
-            response = result.get('text', '')
-    else:
-        response = result.get('text', '')
+def fetch_service_config(svc_no: str) -> dict:
+    logger.debug("Fetching WhatsappConfig for %s", svc_no)
+    formula = f"{{WhatsappNumber}}='{svc_no}'"
+    r = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}",
+                     headers=AIRTABLE_HEADERS,
+                     params={"filterByFormula": formula})
+    r.raise_for_status()
+    recs = r.json().get("records", [])
+    if not recs:
+        raise ValueError(f"No WhatsappConfig for {svc_no}")
+    f = recs[0]["fields"]
+    biz_list = f.get("BusinessID (from Business)", [])
+    if not biz_list:
+        raise ValueError("Config row missing BusinessID lookup")
+    return {
+        "WA_ID":           f["WA_ID"],
+        "BusinessID":      biz_list[0],
+        "WassengerApiKey": f["WASSENGER_API_KEY"],
+        "Role":            f.get("Role",""),
+    }
 
-    # 6) Send via WhatsApp API helper
-    tools.send_whatsapp(phone, response, wcfg.get('ApiKey') or wcfg.get('WassengerApiKey'))
+def fetch_business_settings(biz_id: str) -> dict:
+    logger.debug("Fetching BusinessConfig for %s", biz_id)
+    formula = f"{{BusinessID}}='{biz_id}'"
+    r = requests.get(f"{AIRTABLE_URL}/{TABLES['business']}",
+                     headers=AIRTABLE_HEADERS,
+                     params={"filterByFormula": formula})
+    r.raise_for_status()
+    recs = r.json().get("records", [])
+    if not recs:
+        raise ValueError(f"No BusinessConfig for {biz_id}")
+    f = recs[0]["fields"]
+    return {
+        "DefaultLanguage": f.get("DefaultLanguage","en"),
+        "ClaudePrompt":    f.get("ClaudePrompt",""),
+        "ClaudeModel":     f.get("ClaudeModel","claude-opus-4-20250514"),
+    }
 
-    # 7) Log to history
-    record_history(biz_id, wa_id, phone, tool_name, f"Category={cat}, Msg={msg}, Response={response}")
+def find_template(biz: str, wa: str) -> dict | None:
+    logger.debug("Looking for template for BusinessID=%s, WA_ID=%s", biz, wa)
+    formula = (
+        "AND("
+          "{BusinessID (from Business)}='" + biz + "',"
+          "{WhatsAppConfig}='"             + wa  + "'"
+        ")"
+    )
+    r = requests.get(f"{AIRTABLE_URL}/{TABLES['template']}",
+                     headers=AIRTABLE_HEADERS,
+                     params={"filterByFormula": formula})
+    r.raise_for_status()
+    for rec in r.json().get("records", []):
+        return rec["fields"]
+    return None
 
-    return jsonify(status='ok'), 200
+def find_knowledge(biz: str, msg: str, role: str):
+    logger.debug("Searching KnowledgeBase for BusinessID=%s", biz)
+    formula = f"{{BusinessID}}='{biz}'"
+    r = requests.get(f"{AIRTABLE_URL}/{TABLES['knowledge']}",
+                     headers=AIRTABLE_HEADERS,
+                     params={"filterByFormula": formula})
+    r.raise_for_status()
+    for rec in r.json().get("records", []):
+        flds = rec["fields"]
+        if flds.get("Title","").lower() in msg.lower():
+            scripts = flds.get("RoleScripts") or {}
+            return scripts.get(role) or flds.get("DefaultScript"), \
+                   (flds["ImageURL"][0]["url"] if flds.get("ImageURL") else None)
+    return None, None
 
-# ─── BASIC UNIT TESTS ────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    import unittest
-    
-    class TestStubs(unittest.TestCase):
-        def test_micropip_importable(self):
-            import micropip
-            self.assertTrue(hasattr(micropip, 'install'))
+def validate_form(message: str) -> str:
+    return "Your form looks good. We'll process your order shortly."
 
-        def test_airtable_stub(self):
-            # Airtable.get_all should return a list
-            client = Airtable('base', 'table', 'key')
-            self.assertIsInstance(client.get_all(), list)
+def send_whatsapp(phone: str, text: str, token: str):
+    logger.debug("Sending WhatsApp to %s: %s", phone, text)
+    r = requests.post(
+        "https://api.wassenger.com/v1/messages",
+        headers={"Token": token, "Content-Type": "application/json"},
+        json={"phone": phone, "message": text}
+    )
+    r.raise_for_status()
 
-        def test_tools_stub(self):
-            import tools
-            result = tools.DefaultTool()
-            self.assertIsInstance(result, dict)
-            self.assertIn('text', result)
-            # send_whatsapp should not error
-            tools.send_whatsapp('123', 'msg', 'key')
+def send_image(phone: str, url: str, token: str):
+    logger.debug("Sending image to %s: %s", phone, url)
+    r = requests.post(
+        "https://api.wassenger.com/v1/messages",
+        headers={"Token": token, "Content-Type": "application/json"},
+        json={"phone": phone, "message": "", "url": url}
+    )
+    r.raise_for_status()
 
-        def test_history_stub(self):
-            from your_history_module import record_history, fetch_history
-            record_history('biz','wa','phone','step','hist')
-            self.assertIsInstance(fetch_history(None,'biz','wa','phone'), list)
+def record_history(biz, wa, phone, step, hist):
+    logger.debug("Recording history: biz=%s, wa=%s, phone=%s, step=%s", biz, wa, phone, step)
+    requests.post(
+        f"{AIRTABLE_URL}/{TABLES['history']}",
+        headers={**AIRTABLE_HEADERS, "Content-Type":"application/json"},
+        json={"fields":{
+            "BusinessID":     biz,
+            "WhatsAppConfig": wa,
+            "PhoneNumber":    phone,
+            "CurrentStep":    step,
+            "History":        hist
+        }}
+    )
 
-    unittest.main()
+def record_sales(biz, wa, phone, name, svc):
+    logger.debug("Recording sales: biz=%s, wa=%s, phone=%s, svc=%s", biz, wa, phone, svc)
+    requests.post(
+        f"{AIRTABLE_URL}/{TABLES['sales']}",
+        headers={**AIRTABLE_HEADERS, "Content-Type":"application/json"},
+        json={"fields":{
+            "BusinessID":     biz,
+            "WhatsAppConfig": wa,
+            "PhoneNumber":    phone,
+            "CustomerName":   name,
+            "ServiceBooked":  svc,
+            "Status":         "Pending"
+        }}
+    )
 
-    # For production, run: app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+@app.route("/", methods=["GET","POST"])
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if request.method == "GET":
+        return "OK", 200
+
+    logger.debug("1) Received webhook")
+    payload = request.get_json(force=True)
+    logger.debug("   payload: %s", payload)
+
+    if payload.get("object") == "message" and payload.get("event") == "message:in:new":
+        d = payload["data"]
+        if d.get("meta", {}).get("isGroup"):
+            logger.debug("2) Ignoring group message")
+            return jsonify(status="ignored_group"), 200
+
+        svc_no_lookup = d["toNumber"].lstrip("+")
+        cus_no_lookup = d["fromNumber"].lstrip("+")
+        cus_no_raw    = d["fromNumber"]
+        msg           = d["body"].strip()
+        logger.debug("2) Numbers — lookup svc:%s cus:%s, raw cus:%s", svc_no_lookup, cus_no_lookup, cus_no_raw)
+        logger.debug("   Message: %s", msg)
+
+        scfg = fetch_service_config(svc_no_lookup)
+        bcfg = fetch_business_settings(scfg["BusinessID"])
+        logger.debug("3) Service config: %s", scfg)
+        logger.debug("4) Business settings: %s", bcfg)
+
+        lang = detect_language(msg)
+        logger.debug("5) Detected language: %s", lang)
+
+        tool = select_tool(msg)
+        logger.debug("6) Selected tool: %s", tool)
+
+        if tool == "Default":
+            tpl = find_template(scfg["BusinessID"], scfg["WA_ID"])
+            logger.debug("7a) Template lookup: %s", tpl)
+            if tpl:
+                body = tpl.get("TemplateBody", "")
+                send_whatsapp(cus_no_raw, body, scfg["WassengerApiKey"])
+                record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "template", f"C:{msg}|B:{body}")
+                return jsonify(status="template_sent"), 200
+
+            script, img = find_knowledge(scfg["BusinessID"], msg, scfg["Role"])
+            logger.debug("7b) Knowledge lookup -> script:%s img:%s", script, img)
+            if script:
+                if img:
+                    send_image(cus_no_raw, img, scfg["WassengerApiKey"])
+                send_whatsapp(cus_no_raw, script, scfg["WassengerApiKey"])
+                record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "knowledge", f"C:{msg}|B:{script}")
+                return jsonify(status="knowledge_sent"), 200
+
+            history = f"Customer: {msg}"
+            logger.debug("7c) Calling Claude fallback")
+            resp = call_claude(
+                messages=[
+                    {"role":"system",  "content": bcfg["ClaudePrompt"].format(history=history, user_message=msg)},
+                    {"role":"user",    "content": msg}
+                ],
+                model=bcfg["ClaudeModel"]
+            )
+            reply = resp["choices"][0]["message"]["content"].strip()
+            logger.debug("7c) Claude reply: %s", reply)
+            send_whatsapp(cus_no_raw, reply, scfg["WassengerApiKey"])
+            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "fallback", f"C:{msg}|B:{reply}")
+            if "booking" in reply.lower() or "预约" in reply:
+                record_sales(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "Unknown","TBD")
+            return jsonify(status="ok"), 200
+
+        elif tool == "InfoSearch":
+            script, img = find_knowledge(scfg["BusinessID"], msg, scfg["Role"])
+            logger.debug("8) InfoSearch -> script:%s img:%s", script, img)
+            if img:
+                send_image(cus_no_raw, img, scfg["WassengerApiKey"])
+            send_whatsapp(cus_no_raw, script or "Sorry, I couldn't find that info.", scfg["WassengerApiKey"])
+            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "infos_]()_
