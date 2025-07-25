@@ -1,303 +1,1188 @@
-import os
 import re
 import logging
-import requests
+import time
+import json
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+from flask_sqlalchemy import SQLAlchemy
+import requests
+import openai
+import base64
+from PIL import Image
+from io import BytesIO
+from pdf2image import convert_from_bytes
+import cv2
+import uuid
+import os
+from threading import Timer
+from collections import defaultdict
+import hashlib
+from sqlalchemy import and_
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, Text, TIMESTAMP
+from sqlalchemy.ext.declarative import declarative_base
+Base = declarative_base()
 
-# ───── Load & validate environment variables ─────
-load_dotenv()
-AIRTABLE_PAT     = os.getenv("AIRTABLE_PAT")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-CLAUDE_API_KEY   = os.getenv("CLAUDE_API_KEY")
+# Message buffer: {(bot_id, user_phone, session_id): [msg1, msg2, ...]}
+MESSAGE_BUFFER = defaultdict(list)
+TIMER_BUFFER = {}
 
-if not (AIRTABLE_PAT and AIRTABLE_BASE_ID and CLAUDE_API_KEY):
-    raise RuntimeError("Please set AIRTABLE_PAT, AIRTABLE_BASE_ID, and CLAUDE_API_KEY in your .env")
 
-# ───── Configure logging ─────
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+# --- Universal JSON Prompt Builder ---
+def build_json_prompt(base_prompt, example_json, tag=None):
+    tag_name = tag if tag else "ExampleOutput"
+    json_instruction = (
+        "\n\n<OutputFormat>\n"
+        "Always respond ONLY with a strict, valid JSON object. "
+        "Use double quotes for all keys and string values. "
+        "Do not include any explanation, markdown, or code block formatting—just pure JSON.\n"
+        f"Wrap your response inside <{tag_name}> tags as shown below.\n"
+        "</OutputFormat>\n"
+        f"<{tag_name}>\n"
+        f"{example_json.strip()}\n"
+        f"</{tag_name}>"
+    )
+    return base_prompt.strip() + json_instruction
 
-# ───── Airtable configuration ─────
-AIRTABLE_URL     = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
-AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_PAT}"}
-TABLES = {
-    "business": "BusinessConfig",
-    "config":   "WhatsappConfig",
-    "template": "WhatsAppReplyTemplate",
-    "knowledge":"KnowledgeBase",
-    "history":  "CustomerHistory",
-    "sales":    "SalesData",
-}
+def strip_json_markdown_blocks(text):
+    """Removes ```json ... ``` or ``` ... ``` wrappers from AI output."""
+    return re.sub(r'```[a-z]*\s*([\s\S]*?)```', r'\1', text, flags=re.MULTILINE).strip()
 
-# ───── Flask app ─────
+def build_json_prompt_with_reasoning(base_prompt, example_json, tag=None):
+    tag_name = tag if tag else "ExampleOutput"
+    reasoning_instruction = (
+        "\n\n<Reasoning>\n"
+        "Before answering, briefly explain your reasoning for the tool selection in 1-2 sentences."
+        " After your reasoning, output ONLY the strict JSON inside <{tag}> tags as shown below."
+        " Do not add code block formatting or any other explanation after the JSON.\n"
+        "</Reasoning>"
+    ).replace("{tag}", tag_name)
+    json_instruction = (
+        reasoning_instruction +
+        "\n\n<OutputFormat>\n"
+        "Always respond ONLY with a strict, valid JSON object. "
+        "Use double quotes for all keys and string values. "
+        "No markdown, no code block formatting.\n"
+        f"Wrap your response inside <{tag_name}> tags as shown below.\n"
+        "</OutputFormat>\n"
+        f"<{tag_name}>\n"
+        f"{example_json.strip()}\n"
+        f"</{tag_name}>"
+    )
+    return base_prompt.strip() + json_instruction
+
+
+
+
+# Example usage (manager decision):
+# manager_prompt = build_json_prompt(bot.manager_system_prompt, '{\n  "TOOLS": "Default"\n}', tag="ExampleOutput")
+
+# Example usage (reply/tool generation):
+# reply_prompt = build_json_prompt(bot.system_prompt, '{\n  "message": ["hello", "world"]\n}', tag="ExampleOutput")
+
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
+)
+logger = logging.getLogger("UniAI")
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+WASSENGER_API_KEY = os.getenv("WASSENGER_API_KEY")
+
 app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-# ───── Log routes & tools once on first request ─────
-startup_logged = False
+# --- Models ---
+class Bot(db.Model):
+    __tablename__ = 'bots'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50))
+    phone_number = db.Column(db.String(30))
+    config = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime)
+    system_prompt = db.Column(db.Text)
+    manager_system_prompt = db.Column(db.Text)
 
-@app.before_request
-def log_routes_and_tools():
-    global startup_logged
-    if not startup_logged:
-        startup_logged = True
-        # 1) List all Flask routes
-        logger.debug("🚦 Flask routes:")
-        for rule in app.url_map.iter_rules():
-            methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
-            logger.debug(f"  • endpoint={rule.endpoint!r}, path={rule.rule}, methods=[{methods}]")
-        # 2) List all tool IDs
-        tools = [
-            "Default",
-            "InfoSearch",
-            "FormValidation",
-            "RerouteMobile",
-            "RerouteBiz",
-            "RerouteWinback",
-            "DropDropDrop"
-        ]
-        logger.debug("🧰 Available tools: %s", tools)
+class Tool(db.Model):
+    __tablename__ = 'tools'
+    id = db.Column(db.Integer, primary_key=True)
+    tool_id = db.Column(db.String(50))
+    name = db.Column(db.String(100))
+    description = db.Column(db.Text)
+    prompt = db.Column(db.Text)
+    action_type = db.Column(db.String(30))
+    active = db.Column(db.Boolean)
+    created_at = db.Column(db.DateTime)
 
-# ───── Helper functions ─────
-def detect_language(text: str) -> str:
-    return "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
+class BotTool(db.Model):
+    __tablename__ = 'bot_tools'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    tool_id = db.Column(db.String(50))
+    active = db.Column(db.Boolean)
 
-def call_claude(messages: list, model: str) -> dict:
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key":         CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type":      "application/json"
-    }
-    payload = {"model": model, "max_tokens": 1024, "messages": messages}
-    r = requests.post(url, headers=headers, json=payload)
+class Message(db.Model):
+    __tablename__ = 'messages'
+    id = db.Column(db.Integer, primary_key=True)
+    bot_id = db.Column(db.Integer)
+    customer_phone = db.Column(db.String(50))
+    session_id = db.Column(db.String(50))
+    direction = db.Column(db.String(10))  # 'in' or 'out'
+    content = db.Column(db.Text)
+    raw_media_url = db.Column(db.Text)
+    created_at = db.Column(db.DateTime)
+
+class Customer(db.Model):
+    __tablename__ = 'customers'
+    id = db.Column(db.Integer, primary_key=True)
+    phone_number = db.Column(db.String(50), unique=True, nullable=False)
+    name = db.Column(db.String(100))
+    language = db.Column(db.String(10))
+    meta = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Session(db.Model):
+    __tablename__ = 'session'
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customers.id'))
+    bot_id = db.Column(db.Integer)
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    ended_at = db.Column(db.DateTime)
+    status = db.Column(db.String(20), default='open')  # 'open' or 'closed'
+    context = db.Column(db.JSON, default={})
+    customer = db.relationship("Customer")
+
+class Template(db.Model):
+    __tablename__ = 'templates'
+    id = db.Column(db.Integer, primary_key=True)
+    template_id = db.Column(db.String(50))
+    bot_id = db.Column(db.Integer)
+    description = db.Column(db.String(255))
+    content = db.Column(db.JSON)  # JSONB
+    language = db.Column(db.String(10))
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime)
+    updated_at = db.Column(db.DateTime)
+    
+    class MediaFile(Base):
+    __tablename__ = 'media_files'
+    id = Column(Integer, primary_key=True)
+    file_url = Column(Text, nullable=False)
+    file_hash = Column(String(64), nullable=False, unique=True)
+    file_id = Column(String(64), nullable=False)
+    uploaded_at = Column(TIMESTAMP)
+
+# --- Helpers ---
+def download_file(url):
+    r = requests.get(url)
     r.raise_for_status()
-    return r.json()
+    return r.content
 
-def select_tool(msg: str) -> str:
-    router_prompt = """You are a Sales Manager reviewing a WhatsApp conversation. 
-Decide exactly one of the following TOOLS for the SalesPerson to use next.
-Do NOT craft a reply to the customer—ONLY output the tool ID in JSON.
-TOOLS:
-Default         – Continue conversation normally.
-InfoSearch      – Search the company knowledge base.
-FormValidation  – Validate a filled submission form.
-RerouteMobile   – Customer only wants mobile/postpaid.
-RerouteBiz      – Customer wants business/corporate plan.
-RerouteWinback  – Customer is switching from another provider.
-DropDropDrop    – Stop all conversation per policy.
-SalesPersonKnowledge:
-- Has templates & basic Unifi Fibre info.
-- Does NOT know edge-case details.
-Customer said: "%s"
-Output:
-{"TOOLS":"<tool_id>"}
-""" % msg
+def encode_image_b64(img_bytes):
+    return base64.b64encode(img_bytes).decode()
 
-    resp = call_claude(
-        messages=[{"role": "system", "content": router_prompt}],
-        model="claude-opus-4-20250514"
+def extract_text_from_image(img_url, prompt=None):
+    image_bytes = download_wassenger_media(img_url)
+    img_b64 = encode_image_b64(image_bytes)
+    logger.info("[VISION] Sending image to OpenAI Vision...")
+    messages = [
+        {"role": "system", "content": prompt or "Extract all visible text from this image. If no text, describe what you see. Example output is 'user is sending a image with chicken eating chicken'"},
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
+    ]
+    result = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        max_tokens=8192
     )
-    text = resp["choices"][0]["message"]["content"].strip()
-    logger.debug("Router response: %s", text)
+    return result.choices[0].message.content.strip()
+
+def transcribe_audio_from_url(audio_url):
+    # Use Wassenger media download for correct auth
+    audio_bytes = download_wassenger_media(audio_url)
+    if not audio_bytes or len(audio_bytes) < 1024:
+        logger.error("[AUDIO DOWNLOAD] Failed or too small")
+        return "[audio received, transcription failed]"
+    temp_path = "/tmp/temp_audio.ogg"
+    with open(temp_path, "wb") as f:
+        f.write(audio_bytes)
     try:
-        return text.split('"')[1]
-    except:
-        logger.error("Failed to parse tool from router response")
-        return "Default"
+        with open(temp_path, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        logger.info(f"[WHISPER] Transcript: {transcript.text.strip()}")
+        return transcript.text.strip()
+    except Exception as e:
+        logger.error(f"[WHISPER ERROR] {e}")
+        return "[audio received, transcription failed]"
 
-def fetch_service_config(svc_no: str) -> dict:
-    logger.debug("Fetching WhatsappConfig for %s", svc_no)
-    formula = f"{{WhatsappNumber}}='{svc_no}'"
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['config']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    recs = r.json().get("records", [])
-    if not recs:
-        raise ValueError(f"No WhatsappConfig for {svc_no}")
-    f = recs[0]["fields"]
-    biz_list = f.get("BusinessID (from Business)", [])
-    if not biz_list:
-        raise ValueError("Config row missing BusinessID lookup")
-    return {
-        "WA_ID":           f["WA_ID"],
-        "BusinessID":      biz_list[0],
-        "WassengerApiKey": f["WASSENGER_API_KEY"],
-        "Role":            f.get("Role",""),
-    }
+def download_to_bytes(url):
+    """
+    Download a file from a URL and return bytes.
+    """
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    content = resp.content
+    logger.info(f"[DOWNLOAD] {len(content)} bytes downloaded from {url}. First 16 bytes: {content[:16]}")
+    return content
 
-def fetch_business_settings(biz_id: str) -> dict:
-    logger.debug("Fetching BusinessConfig for %s", biz_id)
-    formula = f"{{BusinessID}}='{biz_id}'"
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['business']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    recs = r.json().get("records", [])
-    if not recs:
-        raise ValueError(f"No BusinessConfig for {biz_id}")
-    f = recs[0]["fields"]
-    return {
-        "DefaultLanguage": f.get("DefaultLanguage","en"),
-        "ClaudePrompt":    f.get("ClaudePrompt",""),
-        "ClaudeModel":     f.get("ClaudeModel","claude-opus-4-20250514"),
-    }
+def get_file_hash(file_bytes):
+    return hashlib.sha256(file_bytes).hexdigest()
 
-def find_template(biz: str, wa: str) -> dict | None:
-    logger.debug("Looking for template for BusinessID=%s, WA_ID=%s", biz, wa)
-    formula = (
-        "AND("
-          "{BusinessID (from Business)}='" + biz + "',"
-          "{WhatsAppConfig}='"             + wa  + "'"
-        ")"
-    )
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['template']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    for rec in r.json().get("records", []):
-        return rec["fields"]
+def get_media_file_id_from_db(session, file_hash):
+    from your_models import MediaFile  # Your ORM model
+    row = session.query(MediaFile).filter_by(file_hash=file_hash).first()
+    if row:
+        return row.file_id
     return None
 
-def find_knowledge(biz: str, msg: str, role: str):
-    logger.debug("Searching KnowledgeBase for BusinessID=%s", biz)
-    formula = f"{{BusinessID}}='{biz}'"
-    r = requests.get(f"{AIRTABLE_URL}/{TABLES['knowledge']}",
-                     headers=AIRTABLE_HEADERS,
-                     params={"filterByFormula": formula})
-    r.raise_for_status()
-    for rec in r.json().get("records", []):
-        flds = rec["fields"]
-        if flds.get("Title","").lower() in msg.lower():
-            scripts = flds.get("RoleScripts") or {}
-            return scripts.get(role) or flds.get("DefaultScript"), \
-                   (flds["ImageURL"][0]["url"] if flds.get("ImageURL") else None)
-    return None, None
-
-def validate_form(message: str) -> str:
-    return "Your form looks good. We'll process your order shortly."
-
-def send_whatsapp(phone: str, text: str, token: str):
-    logger.debug("Sending WhatsApp to %s: %s", phone, text)
-    r = requests.post(
-        "https://api.wassenger.com/v1/messages",
-        headers={"Token": token, "Content-Type": "application/json"},
-        json={"phone": phone, "message": text}
+def save_media_file_id_to_db(session, file_url, file_hash, file_id):
+    from your_models import MediaFile
+    obj = MediaFile(
+        file_url=file_url,
+        file_hash=file_hash,
+        file_id=file_id,
+        uploaded_at=datetime.now()
     )
-    r.raise_for_status()
+    session.add(obj)
+    session.commit()
+    return obj
 
-def send_image(phone: str, url: str, token: str):
-    logger.debug("Sending image to %s: %s", phone, url)
-    r = requests.post(
-        "https://api.wassenger.com/v1/messages",
-        headers={"Token": token, "Content-Type": "application/json"},
-        json={"phone": phone, "message": "", "url": url}
+def get_filename_from_url_or_path(input_value, default_ext=".pdf"):
+    """
+    Extracts filename from a URL or file path, or generates a random one.
+    """
+    if isinstance(input_value, str):
+        base = os.path.basename(input_value.split("?")[0])
+        if "." in base:
+            return base
+        else:
+            return base + default_ext
+    else:
+        # If bytes or other, generate a random one
+        return f"file-{uuid.uuid4().hex}{default_ext}"
+
+
+logger = logging.getLogger("UniAI")
+
+def extract_text_from_message(msg):
+    import cv2
+    import numpy as np
+    from pdf2image import convert_from_bytes
+
+    msg_type = msg.get("type")
+    media = msg.get("media", {})
+    msg_text, media_url = None, None
+
+    # Helper: get downloadable media URL (Wassenger)
+    def get_media_url(media):
+        url = media.get("url")
+        if not url and "links" in media and "download" in media["links"]:
+            url = "https://api.wassenger.com" + media["links"]["download"]
+        return url
+
+    # Helper: extract first frame from video (OpenCV)
+    def extract_first_frame_from_video(video_bytes):
+        try:
+            np_arr = np.frombuffer(video_bytes, np.uint8)
+            video_file = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if video_file is None:
+                temp_path = "/tmp/temp_video.mp4"
+                with open(temp_path, "wb") as f:
+                    f.write(video_bytes)
+                cap = cv2.VideoCapture(temp_path)
+            else:
+                cap = cv2.VideoCapture(video_file)
+            success, frame = cap.read()
+            if success and frame is not None:
+                _, buf = cv2.imencode('.png', frame)
+                return buf.tobytes()
+        except Exception as e:
+            logger.error(f"[VIDEO FRAME] Failed: {e}")
+        return None
+
+    # --- Sticker ---
+    if msg_type == "sticker":
+        img_url = get_media_url(media)
+        logger.info(f"[STICKER DEBUG] img_url for Vision: {img_url}")
+        if img_url:
+            try:
+                image_bytes = download_wassenger_media(img_url)
+                # Convert .webp to .png
+                if media.get("extension", "").lower() == "webp":
+                    im = Image.open(BytesIO(image_bytes)).convert("RGBA")
+                    buf = BytesIO()
+                    im.save(buf, format="PNG")
+                    image_bytes = buf.getvalue()
+                img_b64 = encode_image_b64(image_bytes)
+                vision_msg = [
+                    {"role": "system", "content": (
+                        "This is a WhatsApp sticker. "
+                        "Briefly describe what is shown in the sticker, focusing on the main character, action, and emotion. "
+                        "Example output is 'user is sending a sticker with chicken eating chicken'"
+                        "If there is text in the sticker, include it. "
+                        "Reply in a short, natural phrase, no code formatting."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                    ]}
+                ]
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=vision_msg,
+                    max_tokens=8192
+                )
+                msg_text = result.choices[0].message.content.strip()
+                return msg_text or "[Sticker received]", img_url
+            except Exception as e:
+                logger.error(f"[STICKER MEANING] {e}")
+                return "[Sticker received]", img_url
+        return "[Sticker received]", None
+
+    # --- Image ---
+    elif msg_type == "image":
+        img_url = get_media_url(media)
+        logger.info(f"[IMAGE DEBUG] img_url for Vision: {img_url}")
+        if img_url:
+            try:
+                image_bytes = download_wassenger_media(img_url)
+                img_b64 = encode_image_b64(image_bytes)
+                vision_msg = [
+                    {"role": "system", "content": (
+                        "This is a photo/image received on WhatsApp. "
+                        "Summarize briefly what you see, focusing on main objects, scene, or text. "
+                        "Example output is 'user is sending a image with chicken eating chicken'"
+                        "Reply in a short phrase. If there is text, mention it."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                    ]}
+                ]
+                result = openai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=vision_msg,
+                    max_tokens=8192
+                )
+                msg_text = result.choices[0].message.content.strip()
+                return msg_text or "[Image received]", img_url
+            except Exception as e:
+                logger.error(f"[IMAGE MEANING] {e}")
+                return "[Image received]", img_url
+        return "[Image received, no url]", None
+
+    # --- Video (first frame to Vision) ---
+    elif msg_type == "video":
+        vid_url = get_media_url(media)
+        file_name = media.get("filename") or ""
+        if vid_url:
+            try:
+                video_bytes = download_wassenger_media(vid_url)
+                frame_bytes = extract_first_frame_from_video(video_bytes)
+                if frame_bytes:
+                    img_b64 = encode_image_b64(frame_bytes)
+                    vision_msg = [
+                        {"role": "system", "content": (
+                            "This is the first frame of a WhatsApp video. "
+                            "Summarize the scene—main subject, action, or text. Short phrase."
+                            "Example output is 'user is sending a video with chicken eating chicken'"
+                        )},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                        ]}
+                    ]
+                    result = openai.chat.completions.create(
+                        model="gpt-4o",
+                        messages=vision_msg,
+                        max_tokens=128
+                    )
+                    msg_text = result.choices[0].message.content.strip()
+                    return msg_text or f"[Video received: {file_name}]", vid_url
+                else:
+                    return f"[Video received: {file_name}]", vid_url
+            except Exception as e:
+                logger.error(f"[VIDEO MEANING] {e}")
+                return f"[Video received: {file_name}]", vid_url
+        return "[Video received, no url]", None
+
+    # --- Audio (Whisper + GPT summary) ---
+    elif msg_type == "audio":
+        audio_url = get_media_url(media)
+        if audio_url:
+            try:
+                transcript = transcribe_audio_from_url(audio_url)
+                if transcript and transcript.lower() not in ("[audio received, no url]", "[audio received, transcription failed]"):
+                    gpt_prompt = (
+                        "This is a WhatsApp audio message transcribed as: "
+                        f"'{transcript}'. Reply in a short, natural phrase, as if you're the user."
+                    )
+                    result = openai.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{"role": "system", "content": gpt_prompt}],
+                        max_tokens=64
+                    )
+                    msg_text = result.choices[0].message.content.strip()
+                    return {"transcript": transcript, "gpt_reply": msg_text}, audio_url
+                else:
+                    return {"transcript": transcript or "[Audio received, no speech detected]", "gpt_reply": None}, audio_url
+            except Exception as e:
+                logger.error(f"[AUDIO MEANING] {e}")
+                return {"transcript": "[Audio received, error]", "gpt_reply": None}, audio_url
+        return {"transcript": "[Audio received, no url]", "gpt_reply": None}, None
+
+
+    # --- Document (PDF/image: Vision, else filename) ---
+    elif msg_type == "document":
+        doc_url = get_media_url(media)
+        file_name = media.get("filename") or ""
+        ext = (file_name.split(".")[-1] if file_name else "").lower()
+        if doc_url:
+            try:
+                doc_bytes = download_wassenger_media(doc_url)
+                if ext == "pdf":
+                    images = convert_from_bytes(doc_bytes, first_page=1, last_page=1)
+                    if images:
+                        buf = BytesIO()
+                        images[0].save(buf, format="PNG")
+                        img_b64 = encode_image_b64(buf.getvalue())
+                        vision_msg = [
+                            {"role": "system", "content": (
+                                "This is the first page of a PDF document sent via WhatsApp. "
+                                "Example output is 'user is sending a document with details of abc'"
+                                "Summarize what you see—any headings, tables, or visible text. Short natural phrase."
+                            )},
+                            {"role": "user", "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                            ]}
+                        ]
+                        result = openai.chat.completions.create(
+                            model="gpt-4o",
+                            messages=vision_msg,
+                            max_tokens=128
+                        )
+                        msg_text = result.choices[0].message.content.strip()
+                        return msg_text or f"[Document received: {file_name}]", doc_url
+                elif ext in ("jpg", "jpeg", "png"):
+                    img_b64 = encode_image_b64(doc_bytes)
+                    vision_msg = [
+                        {"role": "system", "content": (
+                            "This is an image document received on WhatsApp. "
+                            "Example output is 'user is sending a image with chicken eating chicken'"
+                            "Summarize what you see—main subject, visible text. Short phrase."
+                        )},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                        ]}
+                    ]
+                    result = openai.chat.completions.create(
+                        model="gpt-4o",
+                        messages=vision_msg,
+                        max_tokens=128
+                    )
+                    msg_text = result.choices[0].message.content.strip()
+                    return msg_text or f"[Document received: {file_name}]", doc_url
+                else:
+                    return f"[Document received: {file_name}]", doc_url
+            except Exception as e:
+                logger.error(f"[DOC MEANING] {e}")
+                return f"[Document received: {file_name}]", doc_url
+        return "[Document received, no url]", None
+
+    # --- Fallback ---
+    else:
+        msg_text = msg.get("body") or msg.get("caption") or f"[{msg_type} received]" if msg_type else "[Message received]"
+        return msg_text, None
+
+
+def get_template_content(template_id):
+    template = db.session.query(Template).filter_by(template_id=template_id, active=True).first()
+    if not template or not template.content:
+        return []
+    return template.content if isinstance(template.content, list) else json.loads(template.content)
+
+def download_wassenger_media(url):
+    """
+    Downloads a media file from Wassenger using API Key authentication.
+    Returns bytes if successful, else None.
+    """
+    headers = {"Token": os.getenv("WASSENGER_API_KEY")}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        logger.error(f"[WASSENGER MEDIA DOWNLOAD ERROR] {e}")
+        return None
+
+def upload_media_file(file_url_or_bytes, session):
+    """
+    Handles deduplication + upload + caching for media (image/pdf/etc).
+    - file_url_or_bytes: URL or bytes
+    - session: SQLAlchemy session
+    Returns: file_id or None
+    """
+    # Download or receive as bytes
+    if isinstance(file_url_or_bytes, str) and file_url_or_bytes.startswith("http"):
+        # Download
+        file_bytes = download_to_bytes(file_url_or_bytes)
+        filename = get_filename_from_url_or_path(file_url_or_bytes)
+    else:
+        # Already bytes
+        file_bytes = file_url_or_bytes
+        filename = get_filename_from_url_or_path(None)  # random
+
+    # Compute hash for deduplication
+    file_hash = get_file_hash(file_bytes)
+    file_id = get_media_file_id_from_db(session, file_hash)
+    if file_id:
+        logger.info(f"[MEDIA CACHE] Found cached file_id for {filename}: {file_id}")
+        return file_id
+
+    # Not cached, upload to Wassenger (implement your function)
+    file_id = upload_bytes_to_wassenger(file_bytes, filename=filename)
+    if file_id:
+        save_media_file_id_to_db(session, file_url_or_bytes, file_hash, file_id)
+        logger.info(f"[MEDIA CACHE] Uploaded and cached file_id: {file_id} for {filename}")
+        return file_id
+
+    logger.error(f"[MEDIA CACHE] Failed to upload file: {filename}")
+    return None
+
+    return send_wassenger_reply(
+        recipient,
+        file_id,
+        device_id,
+        msg_type=msg_type,
+        caption=caption,
+        delay_seconds=delay_seconds
     )
-    r.raise_for_status()
 
-def record_history(biz, wa, phone, step, hist):
-    logger.debug("Recording history: biz=%s, wa=%s, phone=%s, step=%s", biz, wa, phone, step)
-    requests.post(
-        f"{AIRTABLE_URL}/{TABLES['history']}",
-        headers={**AIRTABLE_HEADERS, "Content-Type":"application/json"},
-        json={"fields":{
-            "BusinessID":     biz,
-            "WhatsAppConfig": wa,
-            "PhoneNumber":    phone,
-            "CurrentStep":    step,
-            "History":        hist
-        }}
+def download_to_bytes(url):
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+def upload_any_file_to_wassenger(file_path_or_bytes, filename=None, msg_type=None):
+    """
+    Uploads any file (PDF, image, etc.) to Wassenger via multipart/form-data.
+    Accepts local file path, URL, or raw bytes. Returns file_id.
+    Always sets a user-friendly or random filename.
+    Logs and checks file signature before upload.
+    """
+    url = "https://api.wassenger.com/v1/files"
+    headers = {"Token": WASSENGER_API_KEY}
+
+    # Step 1: Get file content and filename
+    if isinstance(file_path_or_bytes, str) and not file_path_or_bytes.startswith("http"):
+        if not filename:
+            filename = os.path.basename(file_path_or_bytes)
+        with open(file_path_or_bytes, "rb") as f:
+            file_bytes = f.read()
+    elif isinstance(file_path_or_bytes, str) and file_path_or_bytes.startswith("http"):
+        # Download file from URL
+        file_bytes = download_to_bytes(file_path_or_bytes)
+        if not filename:
+            filename = get_filename_from_url_or_path(file_path_or_bytes, default_ext=".pdf" if msg_type == "media" else ".jpg")
+    else:
+        # Assume raw bytes (from memory), generate random filename if not provided
+        file_bytes = file_path_or_bytes
+        if not filename:
+            ext = ".pdf" if msg_type == "media" else ".jpg"
+            filename = f"file-{uuid.uuid4().hex}{ext}"
+
+    # Debug: log file signature
+    logger.debug(f"[UPLOAD DEBUG] filename: {filename}, size: {len(file_bytes)}, first 16 bytes: {file_bytes[:16]}")
+    # Signature check (PDF, JPG, PNG)
+    if filename.lower().endswith('.pdf') and not file_bytes.startswith(b'%PDF'):
+        logger.error(f"[UPLOAD DEBUG] This is NOT a valid PDF file! (wrong header)")
+
+    if filename.lower().endswith(('.jpg', '.jpeg')) and not file_bytes.startswith(b'\xff\xd8'):
+        logger.warning(f"[UPLOAD DEBUG] This is NOT a valid JPG file! (wrong header)")
+
+    if filename.lower().endswith('.png') and not file_bytes.startswith(b'\x89PNG'):
+        logger.warning(f"[UPLOAD DEBUG] This is NOT a valid PNG file! (wrong header)")
+
+    files = {"file": (filename, file_bytes)}
+
+    # Step 2: Upload to Wassenger
+    try:
+        resp = requests.post(url, headers=headers, files=files, timeout=30)
+        if resp.status_code == 409:
+            logger.warning(f"[MEDIA UPLOAD] Duplicate file detected (409 Conflict). {filename} already uploaded recently.")
+            return None
+        resp.raise_for_status()
+        resp_json = resp.json()
+        if isinstance(resp_json, list) and resp_json and resp_json[0].get('id'):
+            file_id = resp_json[0]['id']
+        elif isinstance(resp_json, dict) and resp_json.get('id'):
+            file_id = resp_json['id']
+        else:
+            logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files bad response: {resp.text}")
+            return None
+        logger.info(f"[MEDIA UPLOAD SUCCESS] file_id: {file_id} for {filename}")
+        return file_id
+    except Exception as e:
+        logger.error(f"[MEDIA UPLOAD FAIL] Wassenger /files error: {e}")
+        return None
+        
+def send_wassenger_reply(phone, text, device_id, delay_seconds=5, msg_type="text", caption=None):
+    """
+    Always upload image/pdf/media to Wassenger unless text is already a file_id.
+    - For "media" or "image": handles url, file path, or bytes (auto-upload)
+    - For "text": sends as text
+    """
+    url = "https://api.wassenger.com/v1/messages"
+    headers = {"Content-Type": "application/json", "Token": WASSENGER_API_KEY}
+    payload = {"device": device_id}
+
+    # Recipient: phone or group
+    if isinstance(phone, str) and phone.endswith("@g.us"):
+        payload["group"] = phone
+    else:
+        payload["phone"] = phone
+
+    if msg_type == "text":
+        payload["message"] = text
+        payload["schedule"] = {"delay": delay_seconds}
+
+    elif msg_type in ("image", "media"):
+        # Always upload unless text is already a file_id
+        if isinstance(text, str) and len(text) == 24 and text.isalnum():
+            # Wassenger file id, use directly
+            payload["media"] = {"file": text}
+        else:
+            # Upload any URL, file path, or bytes and get file_id
+            if isinstance(text, str) and text.startswith("http"):
+                # Download to bytes
+                file_bytes = download_to_bytes(text)
+                # Try to determine file extension/type
+                if msg_type == "image":
+                    filename = "image.jpg"
+                else:
+                    filename = "document.pdf"
+                file_id = upload_any_file_to_wassenger(file_bytes, filename=filename)
+            else:
+                # Local file path or bytes
+                file_id = upload_any_file_to_wassenger(text)
+            if not file_id:
+                logger.error(f"[SEND {msg_type.upper()}] Failed to upload to Wassenger")
+                return
+            payload["media"] = {"file": file_id}
+        if caption:
+            payload["message"] = caption
+
+    else:
+        logger.error(f"Unsupported msg_type: {msg_type}")
+        return
+
+    payload = {k: v for k, v in payload.items() if v is not None}
+    logger.debug(f"[WASSENGER PAYLOAD]: {payload}")
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        logger.info(f"Wassenger response: {resp.status_code} {resp.text}")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[SEND WASSENGER ERROR] {e}")
+        return None
+
+def notify_sales_group(bot, message, error=False):
+    import json
+    config = bot.config
+    if isinstance(config, str):
+        config = json.loads(config)
+    group_id = (config or {}).get("notification_group")
+    device_id = (config or {}).get("device_id")
+    if group_id and device_id:
+        note = f"[ALERT] {message}" if error else message
+        send_wassenger_reply(group_id, note, device_id)
+    else:
+        logger.warning("[NOTIFY] Notification group or device_id missing in bot.config")
+
+
+def get_bot_by_phone(phone_number):
+    num_variants = [
+        phone_number,
+        phone_number.lstrip('+'),
+        phone_number.replace('+', '').replace('@c.us', ''),
+        '+' + phone_number.replace('@c.us', '').lstrip('+'),
+        phone_number.replace('@c.us', ''),
+    ]
+    logger.debug(f"[DB] Bot lookup attempt for: {phone_number} (variants: {num_variants})")
+    for variant in num_variants:
+        bot = Bot.query.filter_by(phone_number=variant).first()
+        if bot:
+            logger.debug(f"[DB] Bot found! Input: {phone_number}, Matched: {variant} (DB: {bot.phone_number})")
+            return bot
+    logger.error(f"[DB] Bot NOT FOUND for: {phone_number} (tried: {num_variants})")
+    return None
+
+def get_active_tools_for_bot(bot_id):
+    tools = (
+        db.session.query(Tool)
+        .join(BotTool, (Tool.tool_id == BotTool.tool_id) & (BotTool.bot_id == bot_id) & (Tool.active == True) & (BotTool.active == True))
+        .all()
+    )
+    logger.info(f"[DB] Tools for bot_id={bot_id}: {[t.tool_id for t in tools]}")
+    return tools
+
+def save_message(bot_id, customer_phone, session_id, direction, content, raw_media_url=None):
+    msg = Message(
+        bot_id=bot_id,
+        customer_phone=customer_phone,
+        session_id=session_id,
+        direction=direction,
+        content=content,
+        raw_media_url=raw_media_url,
+        created_at=datetime.now()
+    )
+    db.session.add(msg)
+    db.session.commit()
+    logger.info(f"[DB] Saved message ({direction}) for {customer_phone}: {content}")
+
+def get_latest_history(bot_id, customer_phone, session_id, n=20):
+    messages = (Message.query
+        .filter_by(bot_id=bot_id, customer_phone=customer_phone, session_id=session_id)
+        .order_by(Message.created_at.desc())
+        .limit(n)
+        .all())
+    messages = messages[::-1]
+    logger.info(f"[DB] History ({len(messages)} messages) loaded.")
+    return messages
+
+def build_tool_menu_for_prompt(bot_id):
+    tools = get_active_tools_for_bot(bot_id)
+    menu = []
+    for t in tools:
+        menu.append(f"{t.tool_id} ({t.name}): {t.description}")
+    return "\n".join(menu)
+
+def decide_tool_with_manager_prompt(bot, history):
+    # Build history text as before
+    history_text = "\n".join([f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}" for m in history])
+
+    # ---- NEW: Build the tool menu and append to system prompt ----
+    tool_menu = build_tool_menu_for_prompt(bot.id)
+    tool_menu_text = (
+        "Here are the available tools you can select (ID, name, and description):\n"
+        f"{tool_menu}\n"
+        "Choose the single most appropriate tool for this conversation."
     )
 
-def record_sales(biz, wa, phone, name, svc):
-    logger.debug("Recording sales: biz=%s, wa=%s, phone=%s, svc=%s", biz, wa, phone, svc)
-    requests.post(
-        f"{AIRTABLE_URL}/{TABLES['sales']}",
-        headers={**AIRTABLE_HEADERS, "Content-Type":"application/json"},
-        json={"fields":{
-            "BusinessID":     biz,
-            "WhatsAppConfig": wa,
-            "PhoneNumber":    phone,
-            "CustomerName":   name,
-            "ServiceBooked":  svc,
-            "Status":         "Pending"
-        }}
+    # Merge with your manager prompt
+    manager_prompt = build_json_prompt_with_reasoning(
+        (bot.manager_system_prompt or "") + "\n" + tool_menu_text,
+        '{\n  "TOOLS": "Default"\n}',
+        tag="ExampleOutput"
     )
+    logger.info(f"[AI DECISION] manager_system_prompt: {manager_prompt}")
+    logger.info(f"[AI DECISION] history: {history_text}")
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": manager_prompt},
+            {"role": "user", "content": history_text}
+        ],
+        max_tokens=8192,
+        temperature=0
+    )
+    tool_decision = response.choices[0].message.content
 
-@app.route("/", methods=["GET","POST"])
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if request.method == "GET":
-        return "OK", 200
+    # Extract reasoning (for logging/printout)
+    reasoning_match = re.search(r'<Reasoning>(.*?)</Reasoning>', tool_decision, re.DOTALL)
+    if reasoning_match:
+        reasoning = reasoning_match.group(1).strip()
+        logger.info(f"[AI TOOL DECISION REASONING]: {reasoning}")
+        print("\n[AI TOOL DECISION REASONING]:", reasoning)
+    else:
+        logger.info("[AI TOOL DECISION REASONING]: None found")
 
-    logger.debug("1) Received webhook")
-    payload = request.get_json(force=True)
-    logger.debug("   payload: %s", payload)
+    # Extract the JSON block inside <ExampleOutput>
+    match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', tool_decision, re.DOTALL)
+    json_block = match.group(1).strip() if match else tool_decision
+    match_json = re.search(r'"TOOLS":\s*"([^"]+)"', json_block)
+    return match_json.group(1) if match_json else None
 
-    if payload.get("object") == "message" and payload.get("event") == "message:in:new":
-        d = payload["data"]
-        if d.get("meta", {}).get("isGroup"):
-            logger.debug("2) Ignoring group message")
-            return jsonify(status="ignored_group"), 200
 
-        svc_no_lookup = d["toNumber"].lstrip("+")
-        cus_no_lookup = d["fromNumber"].lstrip("+")
-        cus_no_raw    = d["fromNumber"]
-        msg           = d["body"].strip()
-        logger.debug("2) Numbers — lookup svc:%s cus:%s, raw cus:%s", svc_no_lookup, cus_no_lookup, cus_no_raw)
-        logger.debug("   Message: %s", msg)
+def compose_reply(bot, tool, history, context_input):
+    # Compose reply using strict JSON format prompt
+    if tool:
+        prompt = (bot.system_prompt or "") + "\n" + (tool.prompt or "")
+        example_json = '''{
+  "template": "bf_UGnkL24bhtCQBIJr7hbT",
+  "message": [
+    "salam cik atas pakej astro fibre 2025",
+    "cik ada astro tv yang aktif bulanan ke?"
+  ]
+}'''
+    else:
+        prompt = bot.system_prompt or ""
+        example_json = '''{
+  "message": [
+    "astro fibre boleh sambung 10-20+ device",
+    "astro go boleh stream 4 device",
+    "nak proceed sila isi borang ye cik"
+  ]
+}'''
+    reply_prompt = build_json_prompt(prompt, example_json, tag="ExampleOutput")
+    logger.info(f"[AI REPLY] Prompt: {reply_prompt}")
+    messages = [
+        {"role": "system", "content": reply_prompt},
+        {"role": "user", "content": context_input}
+    ]
+    stream = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        max_tokens=8192,
+        temperature=0.3,
+        stream=True
+    )
+    reply_accum = ""
+    print("[STREAM] Streaming model reply:")
+    for chunk in stream:
+        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
+            reply_accum += chunk.choices[0].delta.content
+            print(chunk.choices[0].delta.content, end="", flush=True)
+    logger.info(f"\n[AI REPLY STREAMED]: {reply_accum}")
+    # Extract JSON inside <ExampleOutput>
+    match = re.search(r'<ExampleOutput>(.*?)</ExampleOutput>', reply_accum, re.DOTALL)
+    return match.group(1).strip() if match else reply_accum
 
-        scfg = fetch_service_config(svc_no_lookup)
-        bcfg = fetch_business_settings(scfg["BusinessID"])
-        logger.debug("3) Service config: %s", scfg)
-        logger.debug("4) Business settings: %s", bcfg)
+def process_ai_reply_and_send(customer_phone, ai_reply, device_id, bot_id=None, user=None, session_id=None):
+    """
+    Streams each message in ai_reply['message'] (if array) as separate WhatsApp messages,
+    with short delays, and saves each outgoing message to DB.
+    Handles special session-closing logic for notification/lead/closing.
+    """
+    try:
+        parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
+        parsed = {}
 
-        lang = detect_language(msg)
-        logger.debug("5) Detected language: %s", lang)
+    if not isinstance(parsed, dict):
+        logger.error(f"[WEBHOOK] AI reply did not return a dict. Raw reply: {parsed}")
+        parsed = {}
 
-        tool = select_tool(msg)
-        logger.debug("6) Selected tool: %s", tool)
+    # --- UNIVERSAL BACKEND CLOSING BLOCK ---
+    if parsed.get("instruction") in ("close_session_and_notify_sales", "close_session_drop"):
+        logger.info("[AI REPLY] Instruction: Session close detected. Executing closing/notification logic.")
 
-        if tool == "Default":
-            tpl = find_template(scfg["BusinessID"], scfg["WA_ID"])
-            logger.debug("7a) Template lookup: %s", tpl)
-            if tpl:
-                body = tpl.get("TemplateBody", "")
-                send_whatsapp(cus_no_raw, body, scfg["WassengerApiKey"])
-                record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "template", f"C:{msg}|B:{body}")
-                return jsonify(status="template_sent"), 200
+        # 1. Save any extra fields to session context and close session
+        info_to_save = {}
+        for k, v in parsed.items():
+            if k not in ("message", "notification", "instruction") and v is not None:
+                info_to_save[k] = v
 
-            script, img = find_knowledge(scfg["BusinessID"], msg, scfg["Role"])
-            logger.debug("7b) Knowledge lookup -> script:%s img:%s", script, img)
-            if script:
-                if img:
-                    send_image(cus_no_raw, img, scfg["WassengerApiKey"])
-                send_whatsapp(cus_no_raw, script, scfg["WassengerApiKey"])
-                record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "knowledge", f"C:{msg}|B:{script}")
-                return jsonify(status="knowledge_sent"), 200
+        close_reason = parsed.get("close_reason")
+        if not close_reason:
+            close_reason = "won" if parsed["instruction"] == "close_session_and_notify_sales" else "drop"
 
-            history = f"Customer: {msg}"
-            logger.debug("7c) Calling Claude fallback")
-            resp = call_claude(
-                messages=[
-                    {"role":"system",  "content": bcfg["ClaudePrompt"].format(history=history, user_message=msg)},
-                    {"role":"user",    "content": msg}
-                ],
-                model=bcfg["ClaudeModel"]
+        # 2. Find and update the active session for this customer + bot
+        if bot_id and user and session_id:
+            bot = Bot.query.get(bot_id)
+            customer = Customer.query.filter_by(phone_number=customer_phone).first()
+            session_obj = (
+                db.session.query(Session)
+                .filter_by(bot_id=bot_id, customer_id=customer.id, status="open")
+                .order_by(Session.started_at.desc())
+                .first()
             )
-            reply = resp["choices"][0]["message"]["content"].strip()
-            logger.debug("7c) Claude reply: %s", reply)
-            send_whatsapp(cus_no_raw, reply, scfg["WassengerApiKey"])
-            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "fallback", f"C:{msg}|B:{reply}")
-            if "booking" in reply.lower() or "预约" in reply:
-                record_sales(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "Unknown","TBD")
-            return jsonify(status="ok"), 200
+            if session_obj:
+                session_obj.status = "closed"
+                session_obj.ended_at = datetime.now()
+                session_obj.context = {**session_obj.context, **info_to_save, "close_reason": close_reason}
+                db.session.commit()
+                logger.info(f"[SESSION] Closed session for user {customer_phone}, reason: {close_reason}, info: {info_to_save}")
+            else:
+                logger.warning(f"[SESSION] Tried to close session, but none found for user {customer_phone}, bot {bot_id}")
 
-        elif tool == "InfoSearch":
-            script, img = find_knowledge(scfg["BusinessID"], msg, scfg["Role"])
-            logger.debug("8) InfoSearch -> script:%s img:%s", script, img)
-            if img:
-                send_image(cus_no_raw, img, scfg["WassengerApiKey"])
-            send_whatsapp(cus_no_raw, script or "Sorry, I couldn't find that info.", scfg["WassengerApiKey"])
-            record_history(scfg["BusinessID"], scfg["WA_ID"], cus_no_lookup, "infos_]()_
+        # 3. Notify sales group if present
+        if parsed.get("notification"):
+            logger.info(f"[NOTIFY SALES GROUP]: {parsed['notification']}")
+            notify_sales_group(bot, parsed["notification"])
+
+        # 4. Send all customer-facing messages
+        if "message" in parsed:
+            msg_lines = parsed["message"]
+            if isinstance(msg_lines, str):
+                msg_lines = [msg_lines]
+            for idx, part in enumerate(msg_lines[:4]):  # up to 4 messages
+                if part:
+                    delay = 1 * (idx + 1)
+                    send_wassenger_reply(customer_phone, part, device_id, delay_seconds=delay)
+                    if bot_id and user and session_id:
+                        save_message(bot_id, customer_phone, session_id, "out", part)
+        return  # All done. Do not stream again!
+
+    # --- Stream/send each message line-by-line (normal flow) ---
+    if "message" in parsed and isinstance(parsed["message"], list):
+        for idx, line in enumerate(parsed["message"]):
+            delay = 1 if idx == 0 else 2
+            send_wassenger_reply(
+                customer_phone,
+                line,
+                device_id,
+                delay_seconds=delay,
+                msg_type="text"
+            )
+            # Save outgoing message to DB if info provided
+            if bot_id and user and session_id:
+                save_message(bot_id, customer_phone, session_id, "out", line)
+            if idx < len(parsed["message"]) - 1:
+                time.sleep(delay)
+    else:
+        # fallback: send single message
+        send_wassenger_reply(
+            customer_phone,
+            str(ai_reply),
+            device_id,
+            delay_seconds=1,
+            msg_type="text"
+        )
+        if bot_id and user and session_id:
+            save_message(bot_id, customer_phone, session_id, "out", str(ai_reply))
+
+
+
+
+    # --- TEMPLATE PROCESSING ---
+    if "template" in parsed:
+        template_id = parsed["template"]
+        template_content = get_template_content(template_id)
+        doc_counter = 1
+        img_counter = 1
+        for idx, part in enumerate(template_content):
+            content_type = part.get("type")
+            content_value = part.get("content")
+            caption = part.get("caption") or None
+
+            if content_type == "text":
+                send_wassenger_reply(customer_phone, content_value, device_id, delay_seconds=5)
+                if bot_id and user and session_id:
+                    save_message(bot_id, user, session_id, "out", content_value)
+
+            elif content_type == "image":
+                filename = f"image{img_counter}.jpg"
+                img_counter += 1
+                # << Use persistent cache-aware uploader >>
+                file_id = upload_media_file(content_value, db.session, filename=filename)
+                if file_id:
+                    send_wassenger_reply(
+                        customer_phone,
+                        file_id,
+                        device_id,
+                        msg_type="image",
+                        caption=caption
+                    )
+                    if bot_id and user and session_id:
+                        save_message(bot_id, user, session_id, "out", "[Image sent]")
+                else:
+                    logger.warning(f"[MEDIA SEND] Failed to upload/send image: {filename}")
+
+            elif content_type == "document":
+                filename = f"document{doc_counter}.pdf"
+                doc_counter += 1
+                # << Use persistent cache-aware uploader >>
+                file_id = upload_media_file(content_value, db.session, filename=filename)
+                if file_id:
+                    send_wassenger_reply(
+                        customer_phone,
+                        file_id,
+                        device_id,
+                        msg_type="media",
+                        caption=caption
+                    )
+                    if bot_id and user and session_id:
+                        save_message(bot_id, user, session_id, "out", "[PDF sent]")
+                else:
+                    logger.warning(f"[MEDIA SEND] Failed to upload/send document: {filename}")
+
+            # Wait between template parts
+            if idx < len(template_content) - 1:
+                time.sleep(3)
+
+def find_or_create_customer(phone, name=None):
+    customer = Customer.query.filter_by(phone_number=phone).first()
+    if not customer:
+        customer = Customer(phone_number=phone, name=name)
+        db.session.add(customer)
+        db.session.commit()
+    return customer
+
+def get_or_create_session(customer_id, bot_id):
+    session_obj = Session.query.filter_by(customer_id=customer_id, bot_id=bot_id, status='open').first()
+    if not session_obj:
+        session_obj = Session(
+            customer_id=customer_id,
+            bot_id=bot_id,
+            started_at=datetime.now(),
+            status='open',
+            context={},
+        )
+        db.session.add(session_obj)
+        db.session.commit()
+    return session_obj
+
+
+def close_session(session, reason, info: dict = None):
+    session.ended_at = datetime.now()
+    session.status = 'closed'
+    if info:
+        session.context.update(info)
+    session.context['close_reason'] = reason
+    db.session.commit()
+
+def process_buffered_messages(buffer_key):
+    with app.app_context():
+        bot_id, user_phone, session_id = buffer_key
+        bot = Bot.query.get(bot_id)
+        messages = MESSAGE_BUFFER.pop(buffer_key, [])
+        if not messages:
+            return
+        device_id = messages[-1].get("device_id") 
+        
+        combined_text = "\n".join(m['msg_text'] for m in messages if m['msg_text'])
+        history = get_latest_history(bot_id, user_phone, session_id)
+        context_input = "\n".join([
+            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+            for m in history
+        ] + [f"User: {combined_text}"])
+        tool_id = decide_tool_with_manager_prompt(bot, history)
+        tool = None
+        if tool_id and tool_id.lower() != "default":
+            for t in get_active_tools_for_bot(bot.id):
+                if t.tool_id == tool_id:
+                    tool = t
+                    break
+        ai_reply = compose_reply(bot, tool, history, context_input)
+        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    logger.info("[WEBHOOK] Received POST /webhook")
+    data = request.json
+    logger.info(f"[WEBHOOK] Full incoming message: {json.dumps(data)}")
+    logger.info(f"[WEBHOOK] Incoming data: {data}")
+
+    try:
+        msg = data["data"]
+        msg_type = msg.get("type")
+        if msg.get("flow") == "outbound":
+            return jsonify({"status": "ignored"}), 200
+        # Ignore all group messages (from group chat)
+        if (
+            "@g.us" in msg.get("from", "")  # sender is a group
+            or (msg.get("chat", {}).get("type") == "group")  # chat type is group
+            or msg.get("meta", {}).get("isGroup") is True    # meta says is group
+        ):
+            logger.info(f"[WEBHOOK] Ignored group message from: {msg.get('from')}")
+            return jsonify({"status": "ignored_group"}), 200
+        
+
+        bot_phone = msg.get("toNumber")
+        user_phone = msg.get("fromNumber")
+        device_id = data["device"]["id"]
+
+        # 1. Extract bot and message first
+        bot = get_bot_by_phone(bot_phone)
+        if not bot:
+            logger.error(f"[ERROR] No bot found for phone {bot_phone}")
+            return jsonify({"error": "Bot not found"}), 404
+
+        msg_type = msg.get("type")
+        if msg_type == "audio":
+            extract_result, raw_media_url = extract_text_from_message(msg)
+            transcript = extract_result["transcript"]
+            gpt_reply = extract_result["gpt_reply"]
+            # Save the transcript as the 'in' message
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", transcript, raw_media_url=raw_media_url)
+            msg_text = gpt_reply or transcript  # For downstream use (AI, etc)
+        else:
+            msg_text, raw_media_url = extract_text_from_message(msg)
+            customer = find_or_create_customer(user_phone)
+            session = get_or_create_session(customer.id, bot.id)
+            session_id = str(session.id)
+            save_message(bot.id, user_phone, session_id, "in", msg_text, raw_media_url=raw_media_url)
+
+            # Add to message buffer
+        # Add to message buffer and start/refresh the timer
+        buffer_key = (bot.id, user_phone, session_id)
+        MESSAGE_BUFFER[buffer_key].append({
+            "msg_text": msg_text,
+            "raw_media_url": raw_media_url,
+            "created_at": datetime.now().isoformat(),
+            "device_id": device_id,    # ADD THIS LINE
+        })
+
+        # --- Start or reset the 30s buffer timer for this key ---
+        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+            TIMER_BUFFER[buffer_key].cancel()
+        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+        TIMER_BUFFER[buffer_key].start()
+
+        return jsonify({"status": "buffered, will process in 30s"})
+
+    
+
+        
+        # Buffer timer logic
+        if buffer_key in TIMER_BUFFER and TIMER_BUFFER[buffer_key]:
+            TIMER_BUFFER[buffer_key].cancel()  # Reset the timer
+        TIMER_BUFFER[buffer_key] = Timer(30, process_buffered_messages, args=(buffer_key,))
+        TIMER_BUFFER[buffer_key].start()
+
+        return jsonify({"status": "buffered, will process in 30s"})
+
+        # 3. Only save incoming message ONCE, after customer/session created
+        history = get_latest_history(bot.id, user_phone, session_id)
+
+        # 4. Compose tool and context
+        tool_id = decide_tool_with_manager_prompt(bot, history)
+        tool = None
+        if tool_id and tool_id.lower() != "default":
+            for t in get_active_tools_for_bot(bot.id):
+                if t.tool_id == tool_id:
+                    tool = t
+                    break
+        logger.info(f"[LOGIC] Tool selected: {tool_id}, tool obj: {tool}")
+
+        context_input = "\n".join([
+            f"{'User' if m.direction == 'in' else 'Bot'}: {m.content}"
+            for m in history
+        ])
+
+        ai_reply = compose_reply(bot, tool, history, context_input)
+
+        # 5. Parse AI reply and handle customer info
+        try:
+            ai_reply_stripped = strip_json_markdown_blocks(ai_reply)
+            parsed = ai_reply if isinstance(ai_reply, dict) else json.loads(ai_reply_stripped)
+        except Exception as e:
+            logger.error(f"[WEBHOOK] Could not parse AI reply as JSON: {ai_reply} ({e})")
+            parsed = {}
+
+
+        # 6. Update customer info only after parsed
+        if "name" in parsed:
+            customer.name = parsed["name"]
+            db.session.commit()
+        # (add more: area, language, etc. if in parsed)
+
+
+        # 8. Only send/process reply if session is NOT closed
+        process_ai_reply_and_send(user_phone, ai_reply, device_id, bot_id=bot.id, user=user_phone, session_id=session_id)
+        return jsonify({"status": "ok"})
+
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Exception: {e}")
+        return jsonify({"error": "Webhook processing error"}), 500
+
+# 9. Main run block at file bottom only!
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
